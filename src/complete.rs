@@ -40,16 +40,18 @@ pub struct Item {
     pub insert: String,
     pub detail: String,
     pub kind: Kind,
+    /// Set for items that came from the Java language server.
+    pub lsp: Option<crate::lsp::ItemData>,
 }
 
 impl Item {
     fn new(label: &str, insert: &str, detail: &str, kind: Kind) -> Item {
-        Item { label: label.into(), insert: insert.into(), detail: detail.into(), kind }
+        Item { label: label.into(), insert: insert.into(), detail: detail.into(), kind, lsp: None }
     }
 
     fn method(name: &str, params: &str, ret: &str) -> Item {
         let insert = if params.trim().is_empty() { format!("{name}()$0") } else { format!("{name}($0)") };
-        Item { label: name.into(), insert, detail: format!("({params}) : {ret}"), kind: Kind::Method }
+        Item { label: name.into(), insert, detail: format!("({params}) : {ret}"), kind: Kind::Method, lsp: None }
     }
 }
 
@@ -747,7 +749,7 @@ pub fn complete(
 const MAX_ITEMS: usize = 300;
 
 /// 0 = prefix, 1 = camel-case initials, 2 = substring, 3 = scattered letters.
-fn match_level(label: &str, prefix: &str, lower: &str) -> Option<u8> {
+pub fn match_level(label: &str, prefix: &str, lower: &str) -> Option<u8> {
     if prefix.is_empty() {
         return Some(0);
     }

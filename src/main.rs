@@ -7,6 +7,7 @@ mod editor;
 mod filetree;
 mod highlight;
 mod java;
+mod lsp;
 mod proc;
 mod settings;
 

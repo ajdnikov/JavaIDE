@@ -7,6 +7,7 @@ impl eframe::App for IdeApp {
         let ctx = ui.ctx().clone();
         self.apply_theme(&ctx);
         self.poll_processes(&ctx);
+        self.poll_lsp();
         if let Some(dir) = self.pending_term_dir.take() {
             self.term = None;
             self.start_terminal(&dir, &ctx);
@@ -33,6 +34,7 @@ impl eframe::App for IdeApp {
         }
         egui::CentralPanel::default().show(ui, |ui| self.central(ui));
         self.dialogs(&ctx);
+        self.sync_lsp();
 
         if self.phase != Phase::Idle || self.term.is_some() {
             ctx.request_repaint_after(Duration::from_millis(200));
@@ -43,6 +45,9 @@ impl eframe::App for IdeApp {
         self.settings.save();
         self.stop();
         self.term = None;
+        if let Some(mut l) = self.lsp.take() {
+            l.stop(true);
+        }
     }
 }
 
@@ -144,6 +149,7 @@ impl IdeApp {
                 }
                 if self.root.is_some() && ui.button("Close Folder").clicked() {
                     self.root = None;
+                    self.start_lsp();
                     self.tree.reset();
                     self.index = ProjectIndex::default();
                     self.settings.last_folder = None;
@@ -262,6 +268,24 @@ impl IdeApp {
             ui.label(RichText::new(format!("☕ Java {} · {}", self.jdk.major, self.jdk.origin)).color(jdk_col))
                 .on_hover_text(format!("{}\n{home}", self.jdk.version));
             ui.separator();
+            match self.lsp.as_ref().map(Lsp::status) {
+                Some(Status::Ready) => {
+                    ui.label("✔ Java language server").on_hover_text("Completion, imports and live problems are active");
+                }
+                Some(Status::Starting(m)) => {
+                    ui.spinner();
+                    let short: String = m.chars().take(44).collect();
+                    ui.label(format!("Java: {short}")).on_hover_text(m);
+                }
+                Some(Status::Failed(e)) => {
+                    ui.colored_label(Color32::from_rgb(0xE5, 0xA5, 0x3C), "⚠ Java language server stopped")
+                        .on_hover_text(format!("{e}\nBasic completion is still available."));
+                }
+                None => {
+                    ui.weak("Basic completion").on_hover_text("Open or save a Java file to use the Java language server (the jdtls folder must be next to the exe)");
+                }
+            }
+            ui.separator();
             ui.label(&self.status);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label("UTF-8");
@@ -283,8 +307,9 @@ impl IdeApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("⟳").on_hover_text("Refresh").clicked() {
                     self.tree.refresh();
-                    if let Some(r) = &self.root {
-                        self.index.rebuild(r);
+                    if let Some(r) = self.root.clone() {
+                        self.index.rebuild(&r);
+                        self.notify_files(&[(r, 2)]);
                     }
                 }
                 if let Some(r) = self.root.clone() {
@@ -372,6 +397,12 @@ impl IdeApp {
             ui.ctx().memory_mut(|m| m.request_focus(id));
         }
         let active = self.active.min(self.tabs.len() - 1);
+        let lsp_ready = self.lsp.as_ref().is_some_and(Lsp::is_ready);
+        let diags: &[lsp::Diag] = self.tabs[active]
+            .path
+            .as_deref()
+            .and_then(|p| self.diags.get(&lsp::path_key(p)))
+            .map_or(&[], |(_, d)| d.as_slice());
         let res = editor::editor_ui(
             ui,
             &mut self.tabs[active],
@@ -382,17 +413,62 @@ impl IdeApp {
                 completion: &mut self.completion,
                 autocomplete: self.settings.autocomplete,
                 recent: &self.settings.recent,
+                lsp_ready,
+                diags,
+                session: &mut self.session,
+                quick_menu: &mut self.quick_menu,
             },
         );
         self.line_col = res.line_col;
         if let Some(label) = res.used {
             self.settings.note_used(&label);
         }
-        if res.changed {
+        let tab_id = self.tabs[active].id;
+        if res.cancel_request {
+            if let (Some(l), Some(p)) = (&mut self.lsp, self.pending_completion.take()) {
+                l.cancel(p.id);
+            }
+            self.want_completion = None;
+        }
+        if let Some(a) = res.accepted {
+            if let Some(l) = &mut self.lsp {
+                let id = l.resolve(&a.raw);
+                self.pending_resolves.insert(id, PendingResolve { tab: tab_id, before: a.before });
+            }
+        }
+        if let Some(req) = res.request {
+            if let Some(path) = self.tabs[active].path.clone() {
+                let pos = lsp::pos_of_byte(&self.tabs[active].text, req.byte);
+                self.want_completion = Some((tab_id, path, req, pos));
+            }
+        }
+        if let Some((a, b)) = res.quick_request {
+            match (self.tabs[active].path.clone(), self.lsp.as_ref().is_some_and(Lsp::is_ready)) {
+                (Some(path), true) => {
+                    let list = self.diags.get(&lsp::path_key(&path)).map_or(&[][..], |(_, d)| d.as_slice());
+                    let (range, found) = quick_fix_params(&self.tabs[active].text, list, a, b);
+                    self.want_quick = Some((tab_id, path, range, found));
+                }
+                (None, _) => self.status = "Save the file to use quick fixes.".into(),
+                (_, false) => self.status = "The Java language server is still starting.".into(),
+            }
+        }
+        let changed = res.changed;
+        if let Some(action) = res.quick_choice {
+            self.run_action(&action, false);
+        }
+        if self.tabs.is_empty() {
+            return;
+        }
+        let active = active.min(self.tabs.len() - 1);
+        if changed {
             let tab = &self.tabs[active];
             if let Some(p) = tab.path.clone().filter(|p| p.extension().is_some_and(|e| e == "java")) {
                 let text = tab.text.clone();
                 self.index.update_file(&p, &text);
+                // A build error for this file is out of date as soon as it's edited.
+                let key = lsp::path_key(&p);
+                self.problems.retain(|x| lsp::path_key(&x.file) != key);
             }
             ui.ctx().request_repaint();
         }
@@ -401,7 +477,7 @@ impl IdeApp {
     fn bottom_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.bottom_tab, BottomTab::Output, "Output");
-            let n = self.problems.len();
+            let n = self.problem_list().len();
             let label = if n > 0 { format!("Problems ({n})") } else { "Problems".into() };
             ui.selectable_value(&mut self.bottom_tab, BottomTab::Problems, label);
             if ui.selectable_value(&mut self.bottom_tab, BottomTab::Terminal, "Terminal").clicked() {
@@ -490,12 +566,13 @@ impl IdeApp {
     }
 
     fn problems_tab(&mut self, ui: &mut egui::Ui) {
-        if self.problems.is_empty() {
+        let problems = self.problem_list();
+        if problems.is_empty() {
             ui.weak("No problems.");
         }
         let mut goto: Option<(PathBuf, usize)> = None;
         egui::ScrollArea::vertical().id_salt("problems").auto_shrink([false, false]).show(ui, |ui| {
-            for p in &self.problems {
+            for p in &problems {
                 let icon = if p.is_error {
                     RichText::new("✖").color(Color32::from_rgb(0xE0, 0x6C, 0x6C))
                 } else {
@@ -664,7 +741,8 @@ impl IdeApp {
                         ("Shift+F5", "Stop"),
                         ("Ctrl+B", "Build"),
                         ("Ctrl+Space", "Code completion"),
-                        ("Tab / Shift+Tab", "Indent / dedent"),
+                        ("Ctrl+.", "Quick fix (add import, ...)"),
+                        ("Tab / Shift+Tab", "Indent / dedent, or next / previous field"),
                         ("Ctrl+/", "Toggle line comment"),
                         ("Ctrl+S / Ctrl+Shift+S", "Save / save all"),
                         ("Ctrl+N / Ctrl+O", "New file / open folder"),
@@ -736,6 +814,7 @@ impl IdeApp {
                                     }
                                 }
                             }
+                            self.notify_files(&[(path.clone(), 3), (new.clone(), 1)]);
                             self.tree.refresh();
                             if let Some(r) = &self.root {
                                 self.index.rebuild(r);
@@ -752,6 +831,7 @@ impl IdeApp {
                         Ok(()) => {
                             self.tabs.retain(|t| t.path.as_ref().is_none_or(|p| !p.starts_with(path)));
                             self.active = self.active.min(self.tabs.len().saturating_sub(1));
+                            self.notify_files(&[(path.clone(), 3)]);
                             self.tree.refresh();
                             if let Some(r) = &self.root {
                                 self.index.rebuild(r);
@@ -797,6 +877,7 @@ impl IdeApp {
                     self.settings.save();
                     self.status = format!("Using {} ({})", self.jdk.version, self.jdk.origin);
                     self.term = None; // restarted lazily so PATH picks up the new JDK
+                    self.start_lsp();
                     *keep = false;
                 }
             }
