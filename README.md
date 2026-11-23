@@ -9,6 +9,7 @@ and nothing written outside its own folder.
 - **Dark mode** (default) and light mode: toolbar button, *View → Dark mode*, or Settings
 - **Explorer sidebar**: browse folders, open files, and right-click to create, rename, delete (to the recycle bin) or reveal files, or to open a terminal in a folder
 - **Editor**: Java syntax highlighting, line numbers, tabs, smart indent, bracket/brace/quote auto-closing (`{`, `(`, `[`, quotes), `Ctrl+/` comment toggle, Tab/Shift+Tab block indent, and CRLF files saved back as CRLF
+- **Block highlight**: with the cursor next to a `{` or `}`, the whole `{...}` block and its pair of braces are highlighted. Braces in strings and comments are ignored
 - **Code completion**: powered by the Eclipse JDT Language Server, the same engine as VS Code's Java extension. Suggestions appear while you type or with `Ctrl+Space`, and cover the whole JDK, your project and the jars in `lib/`. Accepting a class **adds its `import` automatically**. While the server starts, or if it is missing, a simpler built-in completion is used
   - Method parameters are filled in as fields: **Tab** and **Shift+Tab** move between them, and repeated names change together
 - **Live problems**: errors and warnings appear as you type, without saving or building, as wavy underlines with a marker in the gutter. Hover an underline for the message; the **Problems** tab lists them for the whole project

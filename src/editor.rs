@@ -24,13 +24,111 @@ pub struct Tab {
     pub id: Id,
     pub goto_line: Option<usize>,
     hl_cache: Option<(u64, LayoutJob)>,
+    /// The `{...}` block at the cursor, for (text hash, selection).
+    brace_cache: Option<(u64, usize, usize, Option<BraceBlock>)>,
+}
+
+/// A `{...}` pair and the part of each line it covers, all in chars.
+#[derive(Clone, Debug, PartialEq)]
+struct BraceBlock {
+    open: usize,
+    close: usize,
+    first_line: usize,
+    lines: Vec<(usize, usize)>,
+}
+
+const BRACE_BLOCK_FILL: Color32 = Color32::from_rgba_premultiplied(9, 16, 22, 26);
+const BRACE_PAIR_FILL: Color32 = Color32::from_rgba_premultiplied(30, 55, 75, 90);
+
+/// The brace the selection touches: the one left of the cursor, else the one right
+/// of it, or a single selected brace. Offsets are bytes of the blanked text.
+fn touching_brace(clean: &[u8], a: usize, b: usize) -> Option<usize> {
+    let is_brace = |i: usize| matches!(clean.get(i), Some(b'{' | b'}'));
+    if a != b {
+        return (b == a + 1 && is_brace(a)).then_some(a);
+    }
+    if a > 0 && is_brace(a - 1) {
+        Some(a - 1)
+    } else if is_brace(a) {
+        Some(a)
+    } else {
+        None
+    }
+}
+
+/// The (open, close) byte offsets of the pair containing the brace at `at`.
+fn matching_brace(clean: &[u8], at: usize) -> Option<(usize, usize)> {
+    let mut depth = 0usize;
+    if clean[at] == b'{' {
+        for (i, &c) in clean.iter().enumerate().skip(at) {
+            match c {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((at, i));
+                    }
+                }
+                _ => {}
+            }
+        }
+    } else {
+        for i in (0..=at).rev() {
+            match clean[i] {
+                b'}' => depth += 1,
+                b'{' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((i, at));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// The block whose brace the char selection `a..b` touches. Braces in strings and
+/// comments don't count.
+fn brace_block(text: &str, a: usize, b: usize) -> Option<BraceBlock> {
+    if !text.contains('{') {
+        return None;
+    }
+    let blanked = complete::blank_comments_and_strings(text);
+    let clean = blanked.as_bytes();
+    let at = touching_brace(clean, byte_of(text, a), byte_of(text, b))?;
+    let (open, close) = matching_brace(clean, at)?;
+    let (open_c, close_c) = (char_of(text, open), char_of(text, close));
+    let mut lines = Vec::new();
+    let (mut start, mut ci) = (open_c, open_c);
+    for ch in text[open..=close].chars() {
+        if ch == '\n' {
+            lines.push((start, ci));
+            start = ci + 1;
+        }
+        ci += 1;
+    }
+    lines.push((start, close_c + 1));
+    Some(BraceBlock { open: open_c, close: close_c, first_line: text[..open].matches('\n').count(), lines })
 }
 
 impl Tab {
     pub fn new(path: Option<PathBuf>, text: String, id: Id) -> Tab {
         let crlf = text.contains("\r\n");
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        Tab { path, saved: text.clone(), text, dirty: false, crlf, id, goto_line: None, hl_cache: None }
+        Tab { path, saved: text.clone(), text, dirty: false, crlf, id, goto_line: None, hl_cache: None, brace_cache: None }
+    }
+
+    /// The block at this selection, recomputed only when the text or selection changes.
+    fn brace_block_at(&mut self, a: usize, b: usize) -> Option<&BraceBlock> {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.text.hash(&mut h);
+        let key = h.finish();
+        if !self.brace_cache.as_ref().is_some_and(|c| (c.0, c.1, c.2) == (key, a, b)) {
+            self.brace_cache = Some((key, a, b, brace_block(&self.text, a, b)));
+        }
+        self.brace_cache.as_ref().and_then(|c| c.3.as_ref())
     }
 
     pub fn title(&self) -> String {
@@ -853,6 +951,8 @@ pub fn editor_ui(ui: &mut egui::Ui, tab: &mut Tab, ec: EditorCtx) -> EditorResul
             let avail_h = ui.available_height();
             let (gutter_rect, _) = ui.allocate_exact_size(Vec2::new(gutter_w, avail_h), Sense::hover());
             let rows = ((avail_h / row_h) as usize).max(1);
+            // Reserved before the text, so the block highlight is drawn behind it.
+            let brace_shape = ui.painter().add(egui::Shape::Noop);
             let out = egui::TextEdit::multiline(&mut tab.text)
                 .id(id)
                 .font(font.clone())
@@ -873,6 +973,34 @@ pub fn editor_ui(ui: &mut egui::Ui, tab: &mut Tab, ec: EditorCtx) -> EditorResul
             // gutter: background + line numbers for visible rows
             let painter = ui.painter();
             let clip = ui.clip_rect();
+
+            // the whole `{...}` block when the cursor is next to one of its braces
+            let selection = out.cursor_range.map(|r| {
+                let (x, y) = (r.primary.index.0, r.secondary.index.0);
+                (x.min(y), x.max(y))
+            });
+            if let Some(block) = selection.and_then(|(x, y)| tab.brace_block_at(x, y)) {
+                let at = |c: usize| galley.pos_from_cursor(CCursor::new(c)).translate(origin.to_vec2());
+                let top = ((clip.top() - origin.y) / row_h).floor().max(0.0) as usize;
+                let bottom = ((clip.bottom() - origin.y) / row_h).ceil().max(0.0) as usize;
+                let from = top.max(block.first_line);
+                let to = bottom.min(block.first_line + block.lines.len() - 1);
+                let mut shapes = Vec::new();
+                for line in from..=to {
+                    let (s, e) = block.lines[line - block.first_line];
+                    let (a, b) = (at(s), at(e));
+                    let right = b.left().max(a.left() + char_w * 0.5);
+                    let area = egui::Rect::from_min_max(a.left_top(), Pos2::new(right, a.bottom()));
+                    shapes.push(egui::Shape::rect_filled(area, 2.0, BRACE_BLOCK_FILL));
+                }
+                for c in [block.open, block.close] {
+                    let (a, b) = (at(c), at(c + 1));
+                    let area = egui::Rect::from_min_max(a.left_top(), Pos2::new(b.left(), a.bottom()));
+                    shapes.push(egui::Shape::rect_filled(area, 2.0, BRACE_PAIR_FILL));
+                }
+                painter.set(brace_shape, egui::Shape::Vec(shapes));
+            }
+
             let full = egui::Rect::from_min_max(
                 Pos2::new(gutter_rect.left(), clip.top().min(gutter_rect.top())),
                 Pos2::new(gutter_rect.right(), clip.bottom().max(origin.y + galley.size().y + 4.0)),
@@ -1318,6 +1446,122 @@ mod tests {
         assert_eq!(t, "    // int x;");
         toggle_comment(&mut t, (5, 5));
         assert_eq!(t, "    int x;");
+    }
+
+    #[test]
+    fn a_cursor_next_to_a_brace_finds_its_block() {
+        let t = "class A {\n    void f() {\n        int x = 1;\n    }\n}\n";
+        let ch = |needle: &str| char_of(t, t.find(needle).unwrap());
+        let (outer_open, inner_open) = (ch("{"), ch("{\n        int"));
+        let inner_close = ch("}\n}");
+        let outer_close = inner_close + 2;
+        let pair = |c: usize| brace_block(t, c, c).map(|b| (b.open, b.close));
+
+        for c in [outer_open, outer_open + 1, outer_close, outer_close + 1] {
+            assert_eq!(pair(c), Some((outer_open, outer_close)), "cursor at {c}");
+        }
+        for c in [inner_open, inner_open + 1, inner_close, inner_close + 1] {
+            assert_eq!(pair(c), Some((inner_open, inner_close)), "cursor at {c}");
+        }
+        assert_eq!(pair(ch("int")), None);
+        // a selected brace counts, any other selection doesn't
+        assert_eq!(brace_block(t, inner_open, inner_open + 1).map(|b| b.close), Some(inner_close));
+        assert_eq!(brace_block(t, inner_open, inner_open + 2), None);
+
+        let b = brace_block(t, inner_open, inner_open).unwrap();
+        assert_eq!(b.first_line, 1);
+        assert_eq!(b.lines.len(), 3);
+        assert_eq!(b.lines[0], (inner_open, inner_open + 1));
+        assert_eq!(b.lines[2].1, inner_close + 1);
+    }
+
+    #[test]
+    fn braces_in_strings_and_comments_do_not_count() {
+        let t = "void f() {\n    String s = \"}\"; // }\n    char c = '{'; /* { */\n}\n";
+        let open = char_of(t, t.find('{').unwrap());
+        let close = char_of(t, t.rfind('}').unwrap());
+        assert_eq!(brace_block(t, open, open).map(|b| b.close), Some(close));
+        assert_eq!(brace_block(t, close + 1, close + 1).map(|b| b.open), Some(open));
+        let in_string = char_of(t, t.find("\"}\"").unwrap()) + 1;
+        assert_eq!(brace_block(t, in_string, in_string), None);
+    }
+
+    #[test]
+    fn unmatched_and_non_ascii_braces() {
+        assert_eq!(brace_block("class A {", 9, 9), None);
+        assert_eq!(brace_block("}", 0, 0), None);
+        let t = "// čšž😀\nclass Č { String š = \"ž\"; }";
+        let open = t[..t.find('{').unwrap()].chars().count();
+        let close = t[..t.find('}').unwrap()].chars().count();
+        assert_eq!(brace_block(t, open, open).map(|b| (b.open, b.close)), Some((open, close)));
+    }
+
+    /// Renders the editor without a window and returns its top-level shapes.
+    fn render_with_cursor(text: &str, cursor: usize) -> Vec<egui::Shape> {
+        let ctx = egui::Context::default();
+        let id = Id::new("brace-test");
+        let mut tab = Tab::new(None, text.to_string(), id);
+        let index = ProjectIndex::default();
+        let (mut completion, mut session, mut quick_menu) = (None, None, None);
+        let mut shapes = Vec::new();
+        for frame in 0..4 {
+            if frame == 1 {
+                ctx.memory_mut(|m| m.request_focus(id));
+                set_cursor(&ctx, id, cursor, cursor);
+            }
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0))),
+                time: Some(frame as f64 * 0.02),
+                focused: true,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    editor_ui(
+                        ui,
+                        &mut tab,
+                        EditorCtx {
+                            dark: true,
+                            font_size: 14.0,
+                            index: &index,
+                            completion: &mut completion,
+                            autocomplete: false,
+                            recent: &[],
+                            lsp_ready: false,
+                            diags: &[],
+                            session: &mut session,
+                            quick_menu: &mut quick_menu,
+                        },
+                    );
+                });
+            });
+            out.textures_delta.clear();
+            shapes = out.shapes.into_iter().map(|c| c.shape).collect();
+        }
+        shapes
+    }
+
+    fn fills(shape: &egui::Shape, color: Color32) -> usize {
+        match shape {
+            egui::Shape::Vec(v) => v.iter().map(|s| fills(s, color)).sum(),
+            egui::Shape::Rect(r) if r.fill == color => 1,
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn the_block_is_painted_behind_the_text() {
+        let t = "class A {\n    int x;\n}\n";
+        let shapes = render_with_cursor(t, t.find('{').unwrap());
+        let block: usize = shapes.iter().map(|s| fills(s, BRACE_BLOCK_FILL)).sum();
+        let pair: usize = shapes.iter().map(|s| fills(s, BRACE_PAIR_FILL)).sum();
+        assert_eq!((block, pair), (3, 2), "one area per line, plus both braces");
+        let highlight = shapes.iter().position(|s| fills(s, BRACE_PAIR_FILL) > 0).unwrap();
+        let text = shapes.iter().position(|s| matches!(s, egui::Shape::Text(_))).unwrap();
+        assert!(highlight < text, "the highlight must not cover the text");
+
+        let away = render_with_cursor(t, t.find("int").unwrap());
+        assert_eq!(away.iter().map(|s| fills(s, BRACE_PAIR_FILL)).sum::<usize>(), 0);
     }
 
     fn session_for(snippet: &str, text: &mut String) -> SnippetSession {
