@@ -8,7 +8,14 @@ and nothing written outside its own folder.
 
 - **Dark mode** (default) and light mode: toolbar button, *View → Dark mode*, or Settings
 - **Explorer sidebar**: browse folders, open files, and right-click to create, rename, delete (to the recycle bin) or reveal files, or to open a terminal in a folder
-- **Editor**: Java syntax highlighting, line numbers, tabs, smart indent, bracket/brace/quote auto-closing (`{`, `(`, `[`, quotes), `Ctrl+/` comment toggle, Tab/Shift+Tab block indent, and CRLF files saved back as CRLF
+- **Editor**: Java syntax highlighting, line numbers, tabs, bracket/brace/quote auto-closing (`{`, `(`, `[`, quotes), `Ctrl+/` comment toggle, Tab/Shift+Tab block indent, and CRLF files saved back as CRLF
+  - Line commands: duplicate, delete and move lines; typing a bracket or quote over a selection wraps it; Home goes to the first non-blank; Backspace removes empty pairs and a whole indent level
+  - Open tabs come back on the next start, closed tabs can be reopened, and files changed by another program are reloaded (you are asked first if they have unsaved edits)
+  - Files in Windows-1250 are shown correctly, and saving converts them to UTF-8
+- **Automatic imports**: a class with exactly one candidate is imported as soon as you move on from typing it, also in pasted code. If there are several (`java.util.Date`, `java.sql.Date`), the status bar says so and `Ctrl+.` lets you choose. `Ctrl+Shift+O` organizes the imports and removes unused ones
+- **Automatic spacing**: Enter indents by the structure of the code (blocks, brace-less `if`/`for`, `case`, wrapped statements, method chains, `/** */` comments), and `}` lines up with its block. When a line is finished, the Java formatter fixes its spacing (`int x=5+3;` becomes `int x = 5 + 3;`). `Shift+Alt+F` formats the whole file
+- **Find and replace**: `Ctrl+F` / `Ctrl+H`, with match case, whole word and regular expressions
+- **Navigation**: go to file (`Ctrl+P`), line (`Ctrl+G`), definition (`F12` or Ctrl+click) and next problem (`F8`), and rename a symbol across the project (`F2`)
 - **Block highlight**: with the cursor next to a `{` or `}`, the whole `{...}` block and its pair of braces are highlighted. Braces in strings and comments are ignored
 - **Code completion**: powered by the Eclipse JDT Language Server, the same engine as VS Code's Java extension. Suggestions appear while you type or with `Ctrl+Space`, and cover the whole JDK, your project and the jars in `lib/`. Accepting a class **adds its `import` automatically**. While the server starts, or if it is missing, a simpler built-in completion is used
   - Method parameters are filled in as fields: **Tab** and **Shift+Tab** move between them, and repeated names change together
@@ -30,11 +37,23 @@ and nothing written outside its own folder.
 | Ctrl+B | Build |
 | Ctrl+Space | Completion |
 | Ctrl+. | Quick fix (add import, ...) |
+| Ctrl+Shift+O | Organize imports |
+| Shift+Alt+F | Format document |
+| F12 / Ctrl+click | Go to definition |
+| F2 | Rename symbol |
+| F8 / Shift+F8 | Next / previous problem |
+| Ctrl+F / Ctrl+H | Find / replace |
+| F3 / Shift+F3 | Next / previous match |
+| Ctrl+P / Ctrl+G | Go to file / line |
+| Ctrl+D | Duplicate line |
+| Ctrl+Shift+K | Delete line |
+| Alt+Up / Alt+Down | Move line |
 | Tab / Shift+Tab | Indent / dedent, or next / previous parameter field |
 | Ctrl+/ | Toggle comment |
 | Ctrl+S / Ctrl+Shift+S | Save / save all |
 | Ctrl+N / Ctrl+O | New file / open folder |
-| Ctrl+W / Ctrl+Tab | Close / next tab |
+| Ctrl+W / Ctrl+Shift+T | Close / reopen tab |
+| Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
 | Ctrl+` | Terminal |
 | Ctrl+= / Ctrl+- | Font size |
 

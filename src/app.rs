@@ -3,18 +3,25 @@ mod ui;
 use crate::complete::ProjectIndex;
 use crate::editor::{self, CompletionState, EditorCtx, QuickMenu, SnippetSession, Tab};
 use crate::filetree::{self, FileTree, TreeAction};
+use crate::find::FindState;
 use crate::java::{self, Jdk, Problem};
 use crate::lsp::{self, ActionStep, Diag, FileOp, Lsp, Status, TextEdit};
 use crate::proc::{self, Proc};
 use crate::settings::{self, Settings};
+use crate::textops;
 use eframe::egui::{self, Color32, Id, Key, KeyboardShortcut, Modifiers, RichText};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 const OUTPUT_CAP: usize = 400_000;
+/// How long typing must pause before a missing class is imported.
+const IMPORT_DELAY: Duration = Duration::from_millis(350);
+const DISK_CHECK: Duration = Duration::from_millis(1500);
+const QUICK_OPEN_ROWS: usize = 14;
+const QUICK_OPEN_MAX_FILES: usize = 20_000;
 
 #[derive(PartialEq, Clone, Copy)]
 enum BottomTab {
@@ -39,6 +46,69 @@ enum Dialog {
     Exit,
     Settings { jdk: String },
     About,
+    GotoLine { value: String },
+    QuickOpen { query: String, files: Vec<PathBuf>, selected: usize },
+    RenameSymbol { path: PathBuf, pos: lsp::Pos, name: String },
+    /// An open file with unsaved edits also changed on disk.
+    FileChanged { idx: usize },
+}
+
+/// Every file under `dir` the Ctrl+P list should offer.
+fn collect_project_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        if out.len() >= QUICK_OPEN_MAX_FILES {
+            return;
+        }
+        let p = e.path();
+        let name = e.file_name().to_string_lossy().to_string();
+        if e.file_type().is_ok_and(|t| t.is_dir()) {
+            if !java::is_ignored_dir(&name) {
+                collect_project_files(&p, out);
+            }
+        } else {
+            out.push(p);
+        }
+    }
+}
+
+/// The files matching `query`, best first.
+fn filter_files<'a>(files: &'a [PathBuf], query: &str) -> Vec<&'a PathBuf> {
+    let query = query.trim();
+    let lower = query.to_lowercase();
+    let mut hits: Vec<(u8, usize, &PathBuf)> = files
+        .iter()
+        .filter_map(|f| {
+            let name = f.file_name()?.to_string_lossy();
+            crate::complete::match_level(&name, query, &lower).map(|level| (level, name.len(), f))
+        })
+        .collect();
+    hits.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)).then_with(|| a.2.cmp(b.2)));
+    hits.into_iter().take(QUICK_OPEN_ROWS).map(|h| h.2).collect()
+}
+
+fn file_stamp(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// A formatting request waiting for the language server.
+struct PendingFormat {
+    id: u64,
+    tab: Id,
+    /// The edits only apply to exactly this text.
+    text: String,
+    /// Formatting while typing: never interrupts, and reports nothing.
+    quiet: bool,
+    lines: Option<(usize, usize)>,
+}
+
+/// A missing class being imported automatically.
+struct PendingImport {
+    id: u64,
+    tab: Id,
+    name: String,
+    package: String,
+    before: String,
 }
 
 /// A completion request waiting for the language server.
@@ -99,6 +169,7 @@ fn apply_file_ops(ctx: &egui::Context, tabs: &mut Vec<Tab>, lsp: Option<&Lsp>, o
             FileOp::Edit { path, edits, .. } => {
                 if let Some(i) = tab_of(tabs, path) {
                     let tab = &mut tabs[i];
+                    editor::mark_undo(ctx, tab.id, &tab.text);
                     let changes = editor::apply_text_edits(&mut tab.text, edits);
                     editor::remap_cursor(ctx, tab.id, &changes);
                     tab.dirty = tab.text != tab.saved;
@@ -207,13 +278,57 @@ pub struct IdeApp {
     applied_dark: Option<bool>,
     pending_term_dir: Option<PathBuf>,
     focus_editor: Option<Id>,
+
+    find: FindState,
+    pending_format: Option<PendingFormat>,
+    /// (tab, file, lines or whole file, quiet); sent once the server has the latest text.
+    want_format: Option<(Id, PathBuf, Option<(usize, usize)>, bool)>,
+    want_definition: Option<(PathBuf, lsp::Pos)>,
+    pending_definition: Option<u64>,
+    pending_rename: Option<u64>,
+    want_organize: Option<PathBuf>,
+    pending_organize: Option<u64>,
+    pending_import: Option<PendingImport>,
+    /// Names with no single import to add, until they stop being missing.
+    import_skip: HashSet<(Id, String)>,
+    /// Names already imported here: if the user removes one, it stays removed.
+    auto_imported: HashSet<(Id, String)>,
+    /// A class waiting for the user to pick its import, and the hint saying so.
+    import_hint: Option<(Id, String, String)>,
+    closed_files: Vec<PathBuf>,
+    last_disk_check: Instant,
+    /// The settings to return to if the dialog is cancelled.
+    settings_backup: Option<Settings>,
+    /// A dialog's body finished it.
+    dialog_done: bool,
 }
 
 impl IdeApp {
     pub fn new(cc: &eframe::CreationContext<'_>, settings: Settings) -> Self {
+        Self::with_context(cc.egui_ctx.clone(), settings, true)
+    }
+
+    fn with_context(egui_ctx: egui::Context, settings: Settings, restore: bool) -> Self {
         let jdk = Jdk::detect(settings.jdk_path.as_deref());
+        let theme_ctx = egui_ctx.clone();
         let mut app = IdeApp {
-            egui_ctx: cc.egui_ctx.clone(),
+            egui_ctx,
+            find: FindState::default(),
+            pending_format: None,
+            want_format: None,
+            want_definition: None,
+            pending_definition: None,
+            pending_rename: None,
+            want_organize: None,
+            pending_organize: None,
+            pending_import: None,
+            import_skip: HashSet::new(),
+            auto_imported: HashSet::new(),
+            import_hint: None,
+            closed_files: Vec::new(),
+            last_disk_check: Instant::now(),
+            settings_backup: None,
+            dialog_done: false,
             lsp: None,
             session: None,
             quick_menu: None,
@@ -254,15 +369,38 @@ impl IdeApp {
             focus_editor: None,
             settings,
         };
-        app.apply_theme(&cc.egui_ctx);
+        app.apply_theme(&theme_ctx);
         app.output = app.welcome_text();
-        // Reopen the last folder, or the bundled sample workspace on first run.
-        let workspace = settings::exe_dir().join("workspace").join("HelloWorld");
-        let start = app.settings.last_folder.clone().filter(|f| f.is_dir()).or_else(|| workspace.is_dir().then_some(workspace));
-        if let Some(f) = start {
-            app.open_folder(f);
+        if restore {
+            // Reopen the last folder, or the bundled sample workspace on first run.
+            let workspace = settings::exe_dir().join("workspace").join("HelloWorld");
+            let start = app.settings.last_folder.clone().filter(|f| f.is_dir()).or_else(|| workspace.is_dir().then_some(workspace));
+            if let Some(f) = start {
+                app.open_folder(f);
+            }
+            app.restore_tabs();
         }
         app
+    }
+
+    /// Reopen the tabs of the last session.
+    fn restore_tabs(&mut self) {
+        let files = std::mem::take(&mut self.settings.open_files);
+        for f in files.iter().filter(|f| f.is_file()) {
+            self.open_file(f);
+        }
+        if let Some(active) = self.settings.active_file.take() {
+            let key = lsp::path_key(&active);
+            if let Some(i) = self.tabs.iter().position(|t| t.path.as_deref().is_some_and(|p| lsp::path_key(p) == key)) {
+                self.active = i;
+            }
+        }
+        self.focus_editor = self.tabs.get(self.active).map(|t| t.id);
+    }
+
+    fn remember_tabs(&mut self) {
+        self.settings.open_files = self.tabs.iter().filter_map(|t| t.path.clone()).collect();
+        self.settings.active_file = self.tabs.get(self.active).and_then(|t| t.path.clone());
     }
 
     fn welcome_text(&self) -> String {
@@ -277,7 +415,7 @@ impl IdeApp {
         } else if !self.jdk.has_javac {
             s.push_str("\n⚠ This is a JRE without javac — compiling won't work. Use a full JDK.\n");
         }
-        s.push_str("\nF5 run · Ctrl+B build · Ctrl+Space complete · Ctrl+/ comment · Ctrl+` terminal\n");
+        s.push_str("\nF5 run · Ctrl+B build · Ctrl+Space complete · Ctrl+F find · Ctrl+P open file · Shift+Alt+F format\n");
         s
     }
 
@@ -349,6 +487,14 @@ impl IdeApp {
         self.quick_menu = None;
         self.pending_quick = None;
         self.want_quick = None;
+        self.pending_format = None;
+        self.want_format = None;
+        self.want_definition = None;
+        self.pending_definition = None;
+        self.pending_rename = None;
+        self.want_organize = None;
+        self.pending_organize = None;
+        self.pending_import = None;
     }
 
     /// Serve the open folder or, without one, the folder of the open Java file.
@@ -494,8 +640,408 @@ impl IdeApp {
                     }
                 }
                 lsp::Event::CommandFailed { message } => self.status = message,
+                lsp::Event::Formatted { id, edits } => {
+                    if self.pending_format.as_ref().is_some_and(|p| p.id == id) {
+                        let p = self.pending_format.take().unwrap();
+                        self.apply_format(&p, &edits);
+                    }
+                }
+                lsp::Event::Definition { id, target } => {
+                    if self.pending_definition == Some(id) {
+                        self.pending_definition = None;
+                        self.show_definition(target);
+                    }
+                }
+                lsp::Event::Renamed { id, result } => {
+                    if self.pending_rename == Some(id) {
+                        self.pending_rename = None;
+                        match result {
+                            Ok(ops) if ops.is_empty() => self.status = "Nothing to rename here.".into(),
+                            Ok(ops) => {
+                                if self.finish_ops(&ops) {
+                                    self.status = "Renamed.".into();
+                                }
+                            }
+                            Err(e) => self.status = e,
+                        }
+                    }
+                }
+                lsp::Event::ImportChoices { id, items } => self.on_import_choices(id, &items),
+                lsp::Event::ImportEdit { id, ops } => self.on_import_edit(id, &ops),
+                lsp::Event::OrganizeAction { id, action } => {
+                    if self.pending_organize == Some(id) {
+                        self.pending_organize = None;
+                        match action {
+                            Some(a) => self.run_action(&a, false),
+                            None => self.status = "No imports to organize.".into(),
+                        }
+                    }
+                }
             }
         }
+    }
+
+    // ------------------------------------------------------------ automatic imports
+
+    /// Import one missing class, once the user has moved on from typing it.
+    fn auto_import_tick(&mut self, ctx: &egui::Context) {
+        if !self.settings.auto_import
+            || self.pending_import.is_some()
+            || self.completion.is_some()
+            || self.session.is_some()
+            || self.quick_menu.is_some()
+            || self.dialog.is_some()
+        {
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let Some(path) = tab.path.as_deref().filter(|p| p.extension().is_some_and(|e| e == "java")) else { return };
+        let Some(l) = self.lsp.as_mut().filter(|l| l.is_ready()) else { return };
+        let list = self.diags.get(&lsp::path_key(path)).map_or(&[][..], |(_, d)| d.as_slice());
+        let missing: Vec<(String, &Diag)> = list.iter().filter_map(|d| lsp::missing_type(&tab.text, d).map(|n| (n, d))).collect();
+        let id = tab.id;
+        self.import_skip.retain(|(t, n)| *t != id || missing.iter().any(|(m, _)| m == n));
+        self.auto_imported.retain(|(t, n)| *t != id || tab.text.contains(n.as_str()));
+        if self.import_hint.as_ref().is_some_and(|(t, n, _)| *t == id && !missing.iter().any(|(m, _)| m == n)) {
+            self.import_hint = None;
+        }
+        let cursor = editor::cursor_of(ctx, id).map(|c| lsp::pos_of_byte(&tab.text, editor::byte_index(&tab.text, c)));
+        let next = missing.iter().find(|(n, d)| {
+            let key = (id, n.clone());
+            !self.import_skip.contains(&key)
+                && !self.auto_imported.contains(&key)
+                // the word under the cursor may still be growing (Date -> DateTime)
+                && !cursor.is_some_and(|c| d.start <= c && c <= d.end)
+        });
+        let Some((name, diag)) = next else { return };
+        if let Some(wait) = tab.last_edit.and_then(|t| IMPORT_DELAY.checked_sub(t.elapsed())) {
+            ctx.request_repaint_after(wait);
+            return;
+        }
+        if let Some(rid) = l.request_import_choices(path, diag) {
+            self.pending_import =
+                Some(PendingImport { id: rid, tab: id, name: name.clone(), package: String::new(), before: tab.text.clone() });
+        }
+    }
+
+    fn on_import_choices(&mut self, id: u64, items: &[lsp::CodeAction]) {
+        let Some(mut p) = self.pending_import.take_if(|p| p.id == id) else { return };
+        if !self.tabs.iter().any(|t| t.id == p.tab && t.text == p.before) {
+            return; // the text moved on: it's looked at again on a later frame
+        }
+        let choices = lsp::import_choices(items, &p.name);
+        match choices.as_slice() {
+            [] => {
+                self.import_skip.insert((p.tab, p.name));
+            }
+            [one] => {
+                p.package = lsp::import_package(&one.title).to_string();
+                if one.raw.get("edit").is_some() {
+                    let ops = lsp::parse_workspace_edit(&one.raw["edit"]);
+                    self.finish_import(p, &ops);
+                } else if let Some(l) = &mut self.lsp {
+                    p.id = l.resolve_import(&one.raw);
+                    self.pending_import = Some(p);
+                }
+            }
+            many => {
+                let packages: Vec<&str> = many.iter().map(|a| lsp::import_package(&a.title)).collect();
+                let hint = format!("{}: press Ctrl+. to choose an import ({})", p.name, packages.join(", "));
+                self.status = hint.clone();
+                self.import_hint = Some((p.tab, p.name.clone(), hint));
+                self.import_skip.insert((p.tab, p.name));
+            }
+        }
+    }
+
+    fn on_import_edit(&mut self, id: u64, ops: &[FileOp]) {
+        if let Some(p) = self.pending_import.take_if(|p| p.id == id) {
+            self.finish_import(p, ops);
+        }
+    }
+
+    fn finish_import(&mut self, p: PendingImport, ops: &[FileOp]) {
+        // A popup or snippet opened meanwhile holds offsets: try again once it's closed.
+        if self.completion.is_some() || self.session.is_some() {
+            return;
+        }
+        let Some(path) = self.tabs.iter().find(|t| t.id == p.tab).and_then(|t| t.path.clone()) else { return };
+        let key = lsp::path_key(&path);
+        let edits: Vec<TextEdit> = ops
+            .iter()
+            .filter_map(|o| match o {
+                FileOp::Edit { path, edits, .. } if lsp::path_key(path) == key => Some(edits.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        if edits.is_empty() {
+            self.import_skip.insert((p.tab, p.name));
+            return;
+        }
+        let (tab_id, name, package) = (p.tab, p.name, p.package);
+        let previous_status = self.status.clone();
+        let applied = Self::apply_imports(
+            &self.egui_ctx,
+            &mut self.tabs,
+            &mut self.completion,
+            &mut self.session,
+            &mut self.status,
+            PendingResolve { tab: tab_id, before: p.before },
+            &edits,
+        );
+        if !applied {
+            self.status = previous_status;
+            return;
+        }
+        if let (Some(tab), Some((_, list))) = (self.tabs.iter_mut().find(|t| t.id == tab_id), self.diags.get_mut(&key)) {
+            tab.last_edit = None;
+            lsp::shift_diags(list, &edits);
+            list.retain(|d| lsp::missing_type(&tab.text, d).as_deref() != Some(name.as_str()));
+        }
+        self.status = match self.import_hint.as_ref().filter(|(t, ..)| *t == tab_id) {
+            Some((_, _, hint)) => format!("Imported {package}.{name} · {hint}"),
+            None => format!("Imported {package}.{name}"),
+        };
+        self.auto_imported.insert((tab_id, name));
+    }
+
+    // ------------------------------------------------------------ formatting and navigation
+
+    fn active_java(&self) -> Option<(Id, PathBuf)> {
+        let tab = self.active_tab()?;
+        let path = tab.path.clone().filter(|p| p.extension().is_some_and(|e| e == "java"))?;
+        Some((tab.id, path))
+    }
+
+    /// The language server can work on the current file, or the status says why not.
+    fn server_ready_for_tab(&mut self) -> Option<(Id, PathBuf)> {
+        let Some(found) = self.active_java() else {
+            self.status = "Open a saved Java file first.".into();
+            return None;
+        };
+        if !self.lsp.as_ref().is_some_and(Lsp::is_ready) {
+            self.status = "The Java language server is still starting.".into();
+            return None;
+        }
+        Some(found)
+    }
+
+    fn format_document(&mut self) {
+        if let Some((tab, path)) = self.server_ready_for_tab() {
+            self.want_format = Some((tab, path, None, false));
+        }
+    }
+
+    fn organize_imports(&mut self) {
+        if let Some((_, path)) = self.server_ready_for_tab() {
+            self.want_organize = Some(path);
+        }
+    }
+
+    fn apply_format(&mut self, p: &PendingFormat, edits: &[TextEdit]) {
+        if p.quiet && (self.completion.is_some() || self.session.is_some()) {
+            return;
+        }
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == p.tab) else { return };
+        if tab.text != p.text {
+            // Fast typing: the edits still fit if only the text after them changed.
+            if p.quiet {
+                let undo_point = tab.text.clone();
+                if let Some((boundary, delta)) = editor::apply_additional(&mut tab.text, &p.text, edits) {
+                    editor::mark_undo(&self.egui_ctx, tab.id, &undo_point);
+                    editor::shift_cursor(&self.egui_ctx, tab.id, boundary, delta);
+                    tab.dirty = tab.text != tab.saved;
+                    self.egui_ctx.request_repaint();
+                }
+            }
+            return;
+        }
+        if edits.is_empty() {
+            if !p.quiet {
+                self.status = "Already formatted, or the file has a syntax error.".into();
+            }
+            return;
+        }
+        editor::mark_undo(&self.egui_ctx, tab.id, &tab.text);
+        let changes = editor::apply_text_edits(&mut tab.text, edits);
+        editor::remap_cursor(&self.egui_ctx, tab.id, &changes);
+        tab.dirty = tab.text != tab.saved;
+        if !p.quiet {
+            self.completion = None;
+            self.session = None;
+            self.quick_menu = None;
+            self.status = "Formatted.".into();
+        }
+        self.egui_ctx.request_repaint();
+    }
+
+    fn show_definition(&mut self, target: Option<(PathBuf, lsp::Pos)>) {
+        let Some((path, pos)) = target else {
+            self.status = "No source available for this symbol.".into();
+            return;
+        };
+        self.open_file(&path);
+        let key = lsp::path_key(&path);
+        if let Some(t) = self.tabs.get_mut(self.active).filter(|t| t.path.as_deref().is_some_and(|p| lsp::path_key(p) == key)) {
+            let c = editor::char_index(&t.text, lsp::byte_of_pos(&t.text, pos));
+            t.reveal = Some((c, c, true));
+        }
+    }
+
+    /// Jump to the next or previous problem, across files.
+    fn next_problem(&mut self, forward: bool) {
+        let list = self.problem_list();
+        if list.is_empty() {
+            self.status = "No problems.".into();
+            return;
+        }
+        let file = self.active_tab().and_then(|t| t.path.as_deref()).map(lsp::path_key).unwrap_or_default();
+        let here = (file, self.line_col.map_or(0, |l| l.0));
+        let key = |p: &Problem| (lsp::path_key(&p.file), p.line);
+        let target = if forward {
+            list.iter().find(|p| key(p) > here).or(list.first())
+        } else {
+            list.iter().rev().find(|p| key(p) < here).or(list.last())
+        };
+        if let Some(p) = target.cloned() {
+            self.open_file(&p.file);
+            if let Some(t) = self.tabs.get_mut(self.active) {
+                t.goto_line = Some(p.line);
+            }
+            self.status = p.message;
+        }
+    }
+
+    // ------------------------------------------------------------ find and replace
+
+    fn open_find(&mut self, ctx: &egui::Context, replace: bool) {
+        self.find.open = true;
+        self.find.show_replace = replace;
+        self.find.focus = true;
+        if let Some(t) = self.active_tab() {
+            if let Some((a, b)) = editor::selection_of(ctx, t.id).filter(|r| r.0 != r.1) {
+                let picked = &t.text[editor::byte_index(&t.text, a)..editor::byte_index(&t.text, b)];
+                if !picked.contains('\n') {
+                    self.find.query = picked.to_string();
+                }
+            }
+        }
+    }
+
+    fn close_find(&mut self) {
+        self.find.open = false;
+        self.focus_editor = self.active_tab().map(|t| t.id);
+    }
+
+    fn find_step(&mut self, forward: bool) {
+        let ctx = self.egui_ctx.clone();
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let cursor = editor::selection_of(&ctx, tab.id).map_or(0, |r| r.0);
+        self.find.refresh(&tab.text, cursor);
+        if let Some((a, b)) = self.find.step(forward) {
+            tab.reveal = Some((a, b, false));
+        }
+    }
+
+    fn replace_one(&mut self) {
+        let ctx = self.egui_ctx.clone();
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let before = tab.text.clone();
+        let Some(next) = self.find.replace_current(&mut tab.text) else { return };
+        if tab.text == before {
+            if let Some((a, b)) = self.find.step(true) {
+                tab.reveal = Some((a, b, false));
+            }
+            return;
+        }
+        editor::mark_undo(&ctx, tab.id, &before);
+        tab.dirty = tab.text != tab.saved;
+        tab.last_edit = Some(Instant::now());
+        self.find.refresh(&tab.text, next);
+        if let Some((a, b)) = self.find.current_match() {
+            tab.reveal = Some((a, b, false));
+        }
+    }
+
+    fn replace_all(&mut self) {
+        let ctx = self.egui_ctx.clone();
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let before = tab.text.clone();
+        let count = self.find.replace_all(&mut tab.text);
+        if tab.text != before {
+            editor::mark_undo(&ctx, tab.id, &before);
+            tab.dirty = tab.text != tab.saved;
+            tab.last_edit = Some(Instant::now());
+            let len = tab.text.chars().count();
+            let cursor = editor::cursor_of(&ctx, tab.id).unwrap_or(0).min(len);
+            editor::select(&ctx, tab.id, cursor, cursor);
+            self.find.refresh(&tab.text, cursor);
+        }
+        self.status = format!("Replaced {count} occurrence(s).");
+    }
+
+    fn quick_open(&mut self) {
+        let Some(root) = self.root.clone() else {
+            self.pick_file();
+            return;
+        };
+        let mut files = Vec::new();
+        collect_project_files(&root, &mut files);
+        self.dialog = Some(Dialog::QuickOpen { query: String::new(), files, selected: 0 });
+    }
+
+    fn reopen_closed(&mut self) {
+        while let Some(path) = self.closed_files.pop() {
+            if path.is_file() {
+                self.open_file(&path);
+                return;
+            }
+        }
+        self.status = "No closed tab to reopen.".into();
+    }
+
+    // ------------------------------------------------------------ files changed elsewhere
+
+    /// Reload open files that changed on disk; ask first if they have unsaved edits.
+    fn poll_disk(&mut self) {
+        if self.dialog.is_some() || self.last_disk_check.elapsed() < DISK_CHECK {
+            return;
+        }
+        self.last_disk_check = Instant::now();
+        for i in 0..self.tabs.len() {
+            let Some(path) = self.tabs[i].path.clone() else { continue };
+            let Some(now) = file_stamp(&path) else { continue };
+            if self.tabs[i].disk_stamp == Some(now) {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let (text, _) = editor::decode_source(&bytes);
+            self.tabs[i].disk_stamp = Some(now);
+            if text.replace("\r\n", "\n").replace('\r', "\n") == self.tabs[i].saved {
+                continue;
+            }
+            if self.tabs[i].dirty {
+                self.dialog = Some(Dialog::FileChanged { idx: i });
+                return;
+            }
+            self.reload_tab(i, &text);
+            self.status = format!("Reloaded {} (changed on disk)", path.display());
+        }
+    }
+
+    fn reload_tab(&mut self, idx: usize, text: &str) {
+        let tab = &mut self.tabs[idx];
+        editor::mark_undo(&self.egui_ctx, tab.id, &tab.text);
+        tab.reload(text);
+        let id = tab.id;
+        if self.completion.as_ref().is_some_and(|c| c.tab_id == id) {
+            self.completion = None;
+        }
+        if self.session.as_ref().is_some_and(|s| s.tab_id == id) {
+            self.session = None;
+        }
+        self.egui_ctx.request_repaint();
     }
 
     fn show_completion(
@@ -544,13 +1090,15 @@ impl IdeApp {
         status: &mut String,
         p: PendingResolve,
         edits: &[TextEdit],
-    ) {
+    ) -> bool {
         if edits.is_empty() {
-            return;
+            return false;
         }
-        let Some(tab) = tabs.iter_mut().find(|t| t.id == p.tab) else { return };
+        let Some(tab) = tabs.iter_mut().find(|t| t.id == p.tab) else { return false };
+        let undo_point = tab.text.clone();
         match editor::apply_additional(&mut tab.text, &p.before, edits) {
             Some((boundary, delta)) => {
+                editor::mark_undo(ctx, tab.id, &undo_point);
                 editor::shift_cursor(ctx, tab.id, boundary, delta);
                 if let Some(s) = session.as_mut().filter(|s| s.tab_id == tab.id) {
                     s.shift_from(boundary, delta);
@@ -560,8 +1108,12 @@ impl IdeApp {
                     *completion = None;
                 }
                 ctx.request_repaint();
+                true
             }
-            None => *status = "Could not add the import: the file changed above it.".into(),
+            None => {
+                *status = "Could not add the import: the file changed above it.".into();
+                false
+            }
         }
     }
 
@@ -586,6 +1138,27 @@ impl IdeApp {
             if let (Some(text), Some(id)) = (text, l.request_code_actions(&path, range, diagnostics)) {
                 self.pending_quick = Some(PendingQuick { id, tab, text });
             }
+        }
+        if let Some((tab, path, mut lines, quiet)) = self.want_format.take() {
+            if let Some(old) = self.pending_format.take() {
+                l.cancel(old.id);
+                // Still unanswered: cover its lines too, so fast typing loses nothing.
+                if let (true, Some(new), Some(prev)) = (old.tab == tab && old.quiet && quiet, lines, old.lines) {
+                    if new.0.abs_diff(prev.1) <= 8 {
+                        lines = Some((new.0.min(prev.0), new.1.max(prev.1)));
+                    }
+                }
+            }
+            let text = self.tabs.iter().find(|t| t.id == tab).map(|t| t.text.clone());
+            if let (Some(text), Some(id)) = (text, l.request_format(&path, lines)) {
+                self.pending_format = Some(PendingFormat { id, tab, text, quiet, lines });
+            }
+        }
+        if let Some((path, pos)) = self.want_definition.take() {
+            self.pending_definition = l.request_definition(&path, pos);
+        }
+        if let Some(path) = self.want_organize.take() {
+            self.pending_organize = l.request_organize(&path);
         }
     }
 
@@ -633,6 +1206,7 @@ impl IdeApp {
         let key = lsp::path_key(path);
         if let Some(i) = self.tabs.iter().position(|t| t.path.as_deref().is_some_and(|p| lsp::path_key(p) == key)) {
             self.active = i;
+            self.focus_editor = Some(self.tabs[i].id);
             return;
         }
         match std::fs::read(path) {
@@ -641,9 +1215,17 @@ impl IdeApp {
                 self.status = format!("{} looks like a binary file", path.display())
             }
             Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes).into_owned();
+                let (text, converted) = editor::decode_source(&bytes);
                 let id = self.new_id();
-                self.tabs.push(Tab::new(Some(path.to_path_buf()), text, id));
+                let mut tab = Tab::new(Some(path.to_path_buf()), text, id);
+                tab.disk_stamp = file_stamp(path);
+                if let Some(from) = converted {
+                    // Shown as modified: the file on disk stays as it is until it's saved.
+                    tab.saved = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
+                    tab.dirty = true;
+                    self.status = format!("{} is {from}: saving converts it to UTF-8.", tab.title());
+                }
+                self.tabs.push(tab);
                 self.active = self.tabs.len() - 1;
                 self.tree.selected = Some(path.to_path_buf());
                 self.focus_editor = Some(id);
@@ -675,6 +1257,7 @@ impl IdeApp {
         match std::fs::write(&path, tab.contents_for_disk()) {
             Ok(()) => {
                 tab.mark_saved();
+                tab.disk_stamp = file_stamp(&path);
                 let text = tab.text.clone();
                 if path.extension().is_some_and(|e| e == "java") {
                     self.index.update_file(&path, &text);
@@ -712,7 +1295,13 @@ impl IdeApp {
             self.dialog = Some(Dialog::CloseTab { idx });
             return;
         }
-        self.tabs.remove(idx);
+        let closed = self.tabs.remove(idx);
+        self.import_skip.retain(|(t, _)| *t != closed.id);
+        self.auto_imported.retain(|(t, _)| *t != closed.id);
+        if let Some(p) = closed.path {
+            self.closed_files.retain(|c| *c != p);
+            self.closed_files.push(p);
+        }
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len().saturating_sub(1);
         } else if idx < self.active {
@@ -813,15 +1402,17 @@ impl IdeApp {
         self.output.clear();
 
         let active_path = self.active_tab().and_then(|t| t.path.clone());
+        // A Java file outside the source folder isn't compiled with the project, so
+        // it runs by itself. Any other file (a README...) just runs the project.
         let in_project = match (&self.root, &active_path) {
-            (Some(r), Some(p)) => p.starts_with(r),
+            (Some(r), Some(p)) => p.extension().is_none_or(|e| e != "java") || p.starts_with(java::source_root(r)),
             (Some(_), None) => true,
             _ => false,
         };
 
         // A file outside any opened folder: use the source launcher.
         if !in_project {
-            let Some(file) = active_path else {
+            let Some(file) = active_path.filter(|p| p.extension().is_some_and(|e| e == "java")) else {
                 self.output.push_str("Open a folder or a .java file first.\n");
                 return;
             };
@@ -1110,6 +1701,7 @@ mod tests {
                         self.lsp.reply_apply_edit(&request, applied);
                     }
                     lsp::Event::CommandFailed { message } => panic!("command failed: {message}"),
+                    _ => {}
                 }
             }
             self.time += 0.02;
@@ -1141,6 +1733,8 @@ mod tests {
                             diags,
                             session: &mut *session,
                             quick_menu: &mut *quick_menu,
+                            find: None,
+                            format_on_type: false,
                         },
                     ));
                 });
@@ -1251,6 +1845,182 @@ mod tests {
             }
         }
         (underline, marker)
+    }
+
+    #[test]
+    fn quick_open_ranks_file_names() {
+        let files: Vec<PathBuf> = ["src/Main.java", "src/util/MainHelper.java", "README.md", "src/Domain.java"].iter().map(PathBuf::from).collect();
+        let names = |q: &str| -> Vec<String> {
+            filter_files(&files, q).iter().map(|p| p.file_name().unwrap().to_string_lossy().to_string()).collect()
+        };
+        assert_eq!(names("main"), ["Main.java", "MainHelper.java", "Domain.java"]);
+        assert_eq!(names("readme"), ["README.md"]);
+        assert_eq!(names("").len(), 4);
+    }
+
+    /// The whole app, headless, against the real server:
+    /// `JAVAIDE_JDTLS=<server folder> cargo test -- --ignored real_server_full_app`
+    #[test]
+    #[ignore]
+    fn real_server_full_app() {
+        struct Drive {
+            ctx: egui::Context,
+            app: IdeApp,
+            time: f64,
+        }
+        impl Drive {
+            fn frame(&mut self, events: Vec<egui::Event>) {
+                self.time += 0.05;
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))),
+                    time: Some(self.time),
+                    focused: true,
+                    events,
+                    ..Default::default()
+                };
+                let (ctx, app) = (self.ctx.clone(), &mut self.app);
+                let mut out = ctx.run_ui(input, |ui| app.draw(ui));
+                out.textures_delta.clear();
+            }
+            fn wait(&mut self, secs: u64, what: &str, mut done: impl FnMut(&IdeApp) -> bool) {
+                let end = Instant::now() + Duration::from_secs(secs);
+                while Instant::now() < end {
+                    self.frame(Vec::new());
+                    if done(&self.app) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                panic!("timed out: {what}\nstatus: {}\n{}", self.app.status, self.text());
+            }
+            fn text(&self) -> String {
+                self.app.tabs[self.app.active].text.clone()
+            }
+            fn cursor_to(&mut self, needle: &str, offset: usize) {
+                let text = self.text();
+                let byte = text.find(needle).unwrap_or_else(|| panic!("{needle} not in\n{text}")) + offset;
+                let id = self.app.tabs[self.app.active].id;
+                self.ctx.memory_mut(|m| m.request_focus(id));
+                self.frame(Vec::new());
+                editor::select(&self.ctx, id, editor::char_index(&text, byte), editor::char_index(&text, byte));
+                self.frame(Vec::new());
+            }
+            fn type_text(&mut self, s: &str) {
+                for c in s.chars() {
+                    if c == '\n' {
+                        self.key(Key::Enter, Modifiers::NONE);
+                    } else {
+                        self.frame(vec![egui::Event::Text(c.to_string())]);
+                        self.frame(Vec::new());
+                    }
+                }
+            }
+            fn key(&mut self, key: Key, modifiers: Modifiers) {
+                self.frame(vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }]);
+                self.frame(Vec::new());
+            }
+        }
+
+        let server = lsp::find_server().expect("set JAVAIDE_JDTLS to the server folder");
+        let root = std::env::temp_dir().join(format!("javaide-app-test-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let file = root.join("src").join("Main.java");
+        let start = "public class Main {\n    public static void main(String[] args) {\n        List<String> names = new ArrayList<>();\n        Date when = null;\n        System.out.println(Arrays.asList(1, 2));\n        // here\n    }\n}\n";
+        std::fs::write(&file, start).unwrap();
+        std::fs::write(root.join("src").join("Other.java"), "public class Other {\n    int value = 1;\n}\n").unwrap();
+        assert!(server.exists());
+
+        let ctx = egui::Context::default();
+        let settings = Settings { format_on_type: true, auto_import: true, ..Settings::default() };
+        let mut app = IdeApp::with_context(ctx.clone(), settings, false);
+        app.open_folder(root.clone());
+        app.open_file(&file);
+        let mut d = Drive { ctx, app, time: 0.0 };
+        d.wait(180, "server ready", |a| a.lsp.as_ref().is_some_and(Lsp::is_ready));
+
+        // 1. Every class with one candidate is imported; the ambiguous one is left alone.
+        d.wait(90, "automatic imports", |a| {
+            let t = &a.tabs[0].text;
+            ["java.util.List;", "java.util.ArrayList;", "java.util.Arrays;"].iter().all(|i| t.contains(i))
+        });
+        d.wait(30, "ambiguous Date reported", |a| a.status.contains("Date") && a.status.contains("java.sql"));
+        assert!(!d.text().contains("import java.util.Date") && !d.text().contains("import java.sql.Date"), "{}", d.text());
+
+        // 2. Undoing an automatic import doesn't bring it straight back.
+        d.cursor_to("// here", 7);
+        let imported = d.text();
+        d.key(Key::Z, Modifiers::COMMAND);
+        d.wait(10, "undo", |a| a.tabs[0].text != imported);
+        let undone = d.text();
+        let gone = ["java.util.List;", "java.util.ArrayList;", "java.util.Arrays;"].iter().find(|i| !undone.contains(**i)).copied();
+        let gone = gone.expect("the undo should remove one import");
+        for _ in 0..80 {
+            d.frame(Vec::new());
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(!d.text().contains(gone), "{gone} came back:\n{}", d.text());
+        d.key(Key::Y, Modifiers::COMMAND);
+        d.wait(10, "redo", |a| a.tabs[0].text.contains(gone));
+
+        // 3. A finished line gets its spacing fixed, with the cursor still at its end.
+        d.wait(30, "problems settled", |a| !a.tabs[0].text.is_empty() && a.pending_import.is_none());
+        d.cursor_to("// here", 7);
+        d.type_text("\nint x=5+3;");
+        d.wait(30, "line formatted", |a| a.tabs[0].text.contains("int x = 5 + 3;"));
+        let text = d.text();
+        let cur = editor::cursor_of(&d.ctx, d.app.tabs[0].id).unwrap();
+        assert!(text[..editor::byte_index(&text, cur)].ends_with("int x = 5 + 3;"), "cursor moved:\n{text}");
+
+        // 4. Enter after a brace-less `if`, and the spacing of the finished header.
+        d.type_text("\nif(x>3)\nx++;\nx--;");
+        d.wait(30, "if formatted", |a| a.tabs[0].text.contains("if (x > 3)\n            x++;\n        x--;"));
+
+        // 5. Format document and organize imports.
+        let messy = "import java.util.List;\nimport java.io.File;\n\npublic class Main {\n  public static void main(String[] args){\n   List<String> a=null;\n  }\n}\n";
+        d.app.tabs[0].text = messy.to_string();
+        d.wait(30, "new text checked", |a| a.pending_import.is_none());
+        std::thread::sleep(Duration::from_millis(600));
+        d.frame(Vec::new());
+        d.app.format_document();
+        d.wait(30, "document formatted", |a| a.tabs[0].text.contains("        List<String> a = null;"));
+        d.app.organize_imports();
+        d.wait(30, "unused import removed", |a| !a.tabs[0].text.contains("java.io.File"));
+        assert!(d.text().contains("import java.util.List;"), "{}", d.text());
+
+        // 6. Go to definition in another file, and rename across files.
+        let uses = "public class Main {\n    public static void main(String[] args) {\n        Other o = new Other();\n        int v = o.value;\n    }\n}\n";
+        d.app.tabs[0].text = uses.to_string();
+        d.wait(30, "server has the text", |a| a.lsp.as_ref().unwrap().doc_version(&file).is_some());
+        std::thread::sleep(Duration::from_millis(800));
+        d.frame(Vec::new());
+        d.cursor_to("o.value", 3);
+        d.key(Key::F12, Modifiers::NONE);
+        d.wait(30, "definition opened", |a| a.tabs.len() == 2 && a.tabs[a.active].title() == "Other.java");
+        d.frame(Vec::new());
+        d.frame(Vec::new());
+        let t = d.text();
+        let at = editor::cursor_of(&d.ctx, d.app.tabs[d.app.active].id).unwrap();
+        assert!(t[editor::byte_index(&t, at)..].starts_with("value"), "landed at: {}", &t[editor::byte_index(&t, at)..]);
+
+        let pos = lsp::pos_of_byte(&t, t.find("value").unwrap());
+        let other = root.join("src").join("Other.java");
+        d.app.pending_rename = d.app.lsp.as_mut().unwrap().request_rename(&other, pos, "amount");
+        d.wait(30, "rename applied", |a| a.tabs.iter().all(|t| t.text.contains("amount")));
+        assert!(d.app.tabs[0].text.contains("o.amount"), "{}", d.app.tabs[0].text);
+
+        // 7. A file changed on disk reloads when it has no unsaved edits.
+        d.app.active = 1;
+        d.app.save_all();
+        std::thread::sleep(Duration::from_millis(30));
+        std::fs::write(&other, "public class Other {\n    int amount = 2; // edited elsewhere\n}\n").unwrap();
+        d.app.last_disk_check = Instant::now() - DISK_CHECK;
+        d.wait(10, "reloaded", |a| a.tabs[1].text.contains("edited elsewhere"));
+        assert!(!d.app.tabs[1].dirty);
+
+        if let Some(mut l) = d.app.lsp.take() {
+            l.stop(true);
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `JAVAIDE_JDTLS=<server folder> cargo test -- --ignored real_server_through`

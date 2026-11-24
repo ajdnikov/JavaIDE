@@ -3,9 +3,11 @@
 
 use crate::complete::{self, Item, Kind, ProjectIndex};
 use crate::highlight;
+use crate::indent;
 use crate::lsp::{self, CodeAction, Diag, TextEdit};
+use crate::textops;
 use eframe::egui::{
-    self, Align, Color32, FontId, Id, Key, Modifiers, Pos2, RichText, Sense, Stroke, Vec2,
+    self, Align, Color32, Event, FontId, Id, Key, Modifiers, Pos2, RichText, Sense, Stroke, Vec2,
     text::{CCursor, CCursorRange, LayoutJob},
     text_edit::TextEditState,
 };
@@ -14,6 +16,25 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Instant, SystemTime};
+
+/// The bytes 0x80..=0xFF of Windows-1250, the usual legacy encoding for Slovene text.
+const CP1250_HIGH: &str = "€\u{81}‚\u{83}„…†‡\u{88}‰Š‹ŚŤŽŹ\u{90}‘’“”•–—\u{98}™š›śťžź\
+\u{A0}ˇ˘Ł¤Ą¦§¨©Ş«¬\u{AD}®Ż°±˛ł´µ¶·¸ąş»Ľ˝ľżŔÁÂĂÄĹĆÇČÉĘËĚÍÎĎĐŃŇÓÔŐÖ×ŘŮÚŰÜÝŢßŕáâăäĺćçčéęëěíîďđńňóôőö÷řůúűüýţ˙";
+
+/// Decode a source file. Returns the text and, if it isn't plain UTF-8, what it
+/// was, so the tab can show that saving will convert it.
+pub fn decode_source(bytes: &[u8]) -> (String, Option<&'static str>) {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return match s.strip_prefix('\u{FEFF}') {
+            Some(rest) => (rest.to_string(), Some("UTF-8 with BOM")),
+            None => (s.to_string(), None),
+        };
+    }
+    let high: Vec<char> = CP1250_HIGH.chars().collect();
+    let text = bytes.iter().map(|&b| if b < 0x80 { b as char } else { high[b as usize - 0x80] }).collect();
+    (text, Some("Windows-1250"))
+}
 
 pub struct Tab {
     pub path: Option<PathBuf>,
@@ -23,6 +44,11 @@ pub struct Tab {
     pub crlf: bool,
     pub id: Id,
     pub goto_line: Option<usize>,
+    /// Select this char range and scroll to it; the flag also focuses the editor.
+    pub reveal: Option<(usize, usize, bool)>,
+    /// The file's modification time when it was last read or written.
+    pub disk_stamp: Option<SystemTime>,
+    pub last_edit: Option<Instant>,
     hl_cache: Option<(u64, LayoutJob)>,
     /// The `{...}` block at the cursor, for (text hash, selection).
     brace_cache: Option<(u64, usize, usize, Option<BraceBlock>)>,
@@ -117,7 +143,28 @@ impl Tab {
     pub fn new(path: Option<PathBuf>, text: String, id: Id) -> Tab {
         let crlf = text.contains("\r\n");
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        Tab { path, saved: text.clone(), text, dirty: false, crlf, id, goto_line: None, hl_cache: None, brace_cache: None }
+        Tab {
+            path,
+            saved: text.clone(),
+            text,
+            dirty: false,
+            crlf,
+            id,
+            goto_line: None,
+            reveal: None,
+            disk_stamp: None,
+            last_edit: None,
+            hl_cache: None,
+            brace_cache: None,
+        }
+    }
+
+    /// Take over the file's new contents after it changed on disk.
+    pub fn reload(&mut self, text: &str) {
+        self.crlf = text.contains("\r\n");
+        self.text = text.replace("\r\n", "\n").replace('\r', "\n");
+        self.saved = self.text.clone();
+        self.dirty = false;
     }
 
     /// The block at this selection, recomputed only when the text or selection changes.
@@ -361,6 +408,10 @@ pub struct EditorCtx<'a> {
     pub diags: &'a [Diag],
     pub session: &'a mut Option<SnippetSession>,
     pub quick_menu: &'a mut Option<QuickMenu>,
+    /// Find matches to highlight (char ranges, ascending) and the current one.
+    pub find: Option<(&'a [(usize, usize)], Option<usize>)>,
+    /// Report which line to tidy when one is finished.
+    pub format_on_type: bool,
 }
 
 /// Ask the language server for completions at this byte offset.
@@ -391,6 +442,12 @@ pub struct EditorResult {
     pub quick_request: Option<(usize, usize)>,
     /// The code action picked from the Ctrl+. menu.
     pub quick_choice: Option<Arc<Value>>,
+    /// These lines (first, last) were just finished and should be formatted.
+    pub format_line: Option<(usize, usize)>,
+    /// F12 or Ctrl+click at this char offset.
+    pub definition: Option<usize>,
+    /// F2 at this char offset.
+    pub rename: Option<usize>,
 }
 
 // ------------------------------------------------------------ text helpers
@@ -430,6 +487,40 @@ fn get_cursor(ctx: &egui::Context, id: Id) -> Option<(usize, usize)> {
     let r = TextEditState::load(ctx, id)?.cursor.char_range()?;
     let (a, b) = (r.primary.index.0, r.secondary.index.0);
     Some((a.min(b), a.max(b)))
+}
+
+/// Undo or redo to the nearest state with different text. The text box also records
+/// cursor moves, which would otherwise make Ctrl+Z seem to do nothing.
+fn step_history(ctx: &egui::Context, id: Id, text: &mut String, redo: bool) -> bool {
+    let Some(mut st) = TextEditState::load(ctx, id) else { return false };
+    let Some(range) = st.cursor.char_range() else { return false };
+    let mut undoer = st.undoer();
+    let mut current = (range, text.clone());
+    let found = loop {
+        let next = if redo { undoer.redo(&current) } else { undoer.undo(&current) }.cloned();
+        match next {
+            Some(state) if state.1 == *text => current = state,
+            other => break other,
+        }
+    };
+    st.set_undoer(undoer);
+    let changed = found.is_some();
+    if let Some((r, t)) = found {
+        st.cursor.set_char_range(Some(r));
+        *text = t;
+    }
+    st.store(ctx, id);
+    changed
+}
+
+/// Make Ctrl+Z return to `text`, before an edit the text box didn't make itself.
+pub fn mark_undo(ctx: &egui::Context, id: Id, text: &str) {
+    let Some(mut st) = TextEditState::load(ctx, id) else { return };
+    let range = st.cursor.char_range().unwrap_or_else(|| CCursorRange::one(CCursor::new(0)));
+    let mut undoer = st.undoer();
+    undoer.add_undo(&(range, text.to_owned()));
+    st.set_undoer(undoer);
+    st.store(ctx, id);
 }
 
 /// Apply `f` to every line touched by the char range; returns the new range.
@@ -477,9 +568,8 @@ fn dedent(text: &mut String, range: (usize, usize)) -> (usize, usize) {
 }
 
 fn toggle_comment(text: &mut String, range: (usize, usize)) -> (usize, usize) {
-    let ba = byte_of(text, range.0);
-    let bb = byte_of(text, range.1);
-    let block = &text[line_start(text, ba)..line_end(text, bb)];
+    let (s, e) = textops::line_span(text, range.0, range.1);
+    let block = &text[s..e];
     let all_commented = block
         .split('\n')
         .filter(|l| !l.trim().is_empty())
@@ -490,8 +580,9 @@ fn toggle_comment(text: &mut String, range: (usize, usize)) -> (usize, usize) {
         .map(|l| leading_ws(l).len())
         .min()
         .unwrap_or(0);
+    let has_code = block.split('\n').any(|l| !l.trim().is_empty());
     transform_lines(text, range, |l| {
-        if l.trim().is_empty() {
+        if l.trim().is_empty() || !has_code {
             l.to_string()
         } else if all_commented {
             let ws = leading_ws(l);
@@ -612,6 +703,15 @@ pub fn cursor_of(ctx: &egui::Context, id: Id) -> Option<usize> {
     get_cursor(ctx, id).map(|r| r.1)
 }
 
+/// The selection of a text box as an ascending char range.
+pub fn selection_of(ctx: &egui::Context, id: Id) -> Option<(usize, usize)> {
+    get_cursor(ctx, id)
+}
+
+pub fn select(ctx: &egui::Context, id: Id, a: usize, b: usize) {
+    set_cursor(ctx, id, a, b);
+}
+
 /// Byte offset where the identifier ending at `bi` starts.
 pub fn word_start(text: &str, bi: usize) -> usize {
     let b = text.as_bytes();
@@ -672,80 +772,136 @@ fn braces_unbalanced(text: &str) -> bool {
     open > close
 }
 
-/// Smart edits after a single typed character. Returns the new cursor if changed.
-fn after_char_typed(text: &mut String, cursor: usize, c: char) -> Option<usize> {
+/// Enter: indent the new line, split empty pairs, and continue block comments.
+fn after_newline(text: &mut String, cursor: usize) -> usize {
     let bc = byte_of(text, cursor);
+    let nl = bc - 1;
+    let ls = line_start(text, nl);
+    let trimmed = complete::blank_comments_and_strings(&text[..nl]);
+    let trimmed = trimmed[ls..].trim_end().to_string();
     let next = text[bc..].chars().next();
-    let prev2 = text[..bc].chars().rev().nth(1);
-    let closer_ok = next.is_none_or(|n| n.is_whitespace() || ")]};,".contains(n));
-    match c {
-        '\n' => {
-            let prev_line_start = line_start(text, bc - 1);
-            let prev_line = &text[prev_line_start..bc - 1];
-            let ws = leading_ws(prev_line).to_string();
-            let trimmed = prev_line.trim_end();
-            let opens = trimmed.ends_with('{') || trimmed.ends_with('(') || trimmed.ends_with('[');
-            let mut ins = ws.clone();
-            if opens {
-                ins.push_str("    ");
+    let rest_of_line = &text[bc..line_end(text, bc)];
+    let trailing = rest_of_line.len() - rest_of_line.trim_start_matches([' ', '\t']).len();
+    let rest_blank = rest_of_line.trim().is_empty();
+
+    let (ins, keep) = match indent::comment_continuation(text, nl) {
+        Some((prefix, close)) => {
+            let n = prefix.chars().count();
+            let mut ins = prefix;
+            if let Some(close) = close {
+                ins.push('\n');
+                ins.push_str(&close);
             }
-            let new_cursor = cursor + ins.chars().count();
-            let rest_of_line = &text[bc..line_end(text, bc)];
+            (ins, n)
+        }
+        None => {
+            let ws = indent::new_line_indent(text, nl);
+            let n = ws.chars().count();
+            let close_ws = ws.strip_suffix(indent::UNIT).unwrap_or(&ws).to_string();
+            let mut ins = ws.clone();
             if trimmed.ends_with('{') {
                 if next == Some('}') {
                     ins.push('\n');
-                    ins.push_str(&ws);
-                } else if rest_of_line.trim().is_empty() && braces_unbalanced(text) {
+                    ins.push_str(&close_ws);
+                } else if rest_blank && braces_unbalanced(text) {
                     ins.push('\n');
-                    ins.push_str(&ws);
+                    ins.push_str(&close_ws);
                     ins.push('}');
                 }
             } else if (trimmed.ends_with('(') && next == Some(')')) || (trimmed.ends_with('[') && next == Some(']')) {
                 ins.push('\n');
-                ins.push_str(&ws);
+                ins.push_str(&close_ws);
             }
-            // drop whitespace that was right after the cursor
-            let trailing = rest_of_line.len() - rest_of_line.trim_start_matches([' ', '\t']).len();
-            text.replace_range(bc..bc + trailing, &ins);
-            Some(new_cursor)
+            (ins, n)
         }
+    };
+    text.replace_range(bc..bc + trailing, &ins);
+    // A line that only held indentation doesn't keep it.
+    let blank_above = text[ls..nl].len();
+    if blank_above > 0 && text[ls..nl].trim().is_empty() {
+        text.replace_range(ls..nl, "");
+        return cursor + keep - blank_above;
+    }
+    cursor + keep
+}
+
+/// Whether the quote before byte `at` is escaped by a backslash.
+fn is_escaped(text: &str, at: usize) -> bool {
+    text.as_bytes()[..at].iter().rev().take_while(|&&b| b == b'\\').count() % 2 == 1
+}
+
+/// Smart edits after a single typed character. Returns the new cursor if changed.
+fn after_char_typed(text: &mut String, cursor: usize, c: char) -> Option<usize> {
+    if c == '\n' {
+        return Some(after_newline(text, cursor));
+    }
+    let bc = byte_of(text, cursor);
+    let at = bc - c.len_utf8();
+    let next = text[bc..].chars().next();
+    let prev2 = text[..bc].chars().rev().nth(1);
+    let closer_ok = next.is_none_or(|n| n.is_whitespace() || ")]};,".contains(n));
+    let in_literal = complete::in_string_or_comment(&text[..at]);
+    match c {
+        '"' | '\'' => {
+            if in_literal {
+                if next == Some(c) && !is_escaped(text, at) {
+                    text.remove(bc);
+                }
+            } else if closer_ok && !prev2.is_some_and(|p| p.is_alphanumeric() || p == '\\' || p == c) {
+                text.insert(bc, c);
+            }
+            None
+        }
+        _ if in_literal => None,
         '}' => {
-            let ls = line_start(text, bc - 1);
-            let before = &text[ls..bc - 1];
+            let ls = line_start(text, at);
+            let before = &text[ls..at];
             if !before.is_empty() && before.trim().is_empty() {
-                let n = before.len().min(4);
-                text.replace_range(bc - 1 - n..bc - 1, "");
-                return Some(cursor - n);
+                let wanted = indent::closing_indent(text, at).unwrap_or_else(|| before[before.len().min(4)..].to_string());
+                let moved = wanted.chars().count() as isize - before.chars().count() as isize;
+                text.replace_range(ls..at, &wanted);
+                return Some(cursor.saturating_add_signed(moved));
             }
             if next == Some('}') {
                 text.remove(bc);
             }
             None
         }
-        ')' | ']' => {
+        ')' | ']' | ';' => {
             if next == Some(c) {
                 text.remove(bc);
             }
             None
         }
-        '{' | '(' | '[' if closer_ok && !complete::in_string_or_comment(&text[..bc - c.len_utf8()]) => {
-            text.insert(bc, match c {
-                '{' => '}',
-                '(' => ')',
-                _ => ']',
-            });
-            None
-        }
-        '"' | '\'' => {
-            if next == Some(c) {
-                text.remove(bc);
-            } else if closer_ok && !prev2.is_some_and(|p| p.is_alphanumeric() || p == '\\' || p == c) {
-                text.insert(bc, c);
-            }
+        '{' | '(' | '[' if closer_ok => {
+            text.insert(bc, textops::closer(c).unwrap_or(c));
             None
         }
         _ => None,
     }
+}
+
+/// The single character this frame's input types, if that's all it does.
+fn typed_char(ctx: &egui::Context) -> Option<char> {
+    ctx.input(|i| {
+        let (mut found, mut inputs) = (None, 0);
+        for e in &i.events {
+            match e {
+                Event::Text(t) | Event::Ime(egui::ImeEvent::Commit(t)) => {
+                    let mut chars = t.chars();
+                    found = chars.next().filter(|_| chars.next().is_none());
+                    inputs += 1;
+                }
+                Event::Key { key: Key::Enter, pressed: true, modifiers, .. } if !modifiers.command && !modifiers.ctrl => {
+                    found = Some('\n');
+                    inputs += 1;
+                }
+                Event::Paste(_) => inputs += 2,
+                _ => {}
+            }
+        }
+        if inputs == 1 { found } else { None }
+    })
 }
 
 // --------------------------------------------------------------------- UI
@@ -762,6 +918,9 @@ pub fn editor_ui(ui: &mut egui::Ui, tab: &mut Tab, ec: EditorCtx) -> EditorResul
     let mut request: Option<CompletionRequest> = None;
     let mut quick_request: Option<(usize, usize)> = None;
     let mut quick_choice: Option<Arc<Value>> = None;
+    let mut format_line: Option<(usize, usize)> = None;
+    let mut definition: Option<usize> = None;
+    let mut rename: Option<usize> = None;
     let mut inserted_stops: Option<StopGroups> = None;
     if ec.session.as_ref().is_some_and(|s| s.tab_id != id) {
         *ec.session = None;
@@ -792,10 +951,62 @@ pub fn editor_ui(ui: &mut egui::Ui, tab: &mut Tab, ec: EditorCtx) -> EditorResul
         NextStop,
         PrevStop,
         EndSnippet,
+        Home { extend: bool },
+        SmartBackspace(usize, usize),
+        Wrap(char),
+        Duplicate,
+        DeleteLine,
+        MoveUp,
+        MoveDown,
+        Definition,
+        Rename,
+        Undo,
+        Redo,
     }
     let mut acts: Vec<Act> = Vec::new();
     if has_focus {
+        let selection = get_cursor(&ctx, id);
+        let text = tab.text.as_str();
         ctx.input_mut(|i| {
+            // Alt+arrows must go first: the plain arrow checks below also match them.
+            if i.consume_key(Modifiers::ALT, Key::ArrowUp) {
+                acts.push(Act::MoveUp);
+            }
+            if i.consume_key(Modifiers::ALT, Key::ArrowDown) {
+                acts.push(Act::MoveDown);
+            }
+            let plain = !quick_open && !popup_open;
+            if plain && !i.modifiers.alt && i.consume_key(Modifiers::NONE, Key::Home) {
+                acts.push(Act::Home { extend: i.modifiers.shift });
+            }
+            if plain && !session_open && !i.modifiers.alt && !i.modifiers.shift && i.key_pressed(Key::Backspace) {
+                let smart = selection.filter(|r| r.0 == r.1).and_then(|r| textops::smart_backspace(text, r.0));
+                if let Some((x, y)) = smart {
+                    if i.consume_key(Modifiers::NONE, Key::Backspace) {
+                        acts.push(Act::SmartBackspace(x, y));
+                    }
+                }
+            }
+            if let Some(r) = selection.filter(|r| plain && !session_open && r.0 != r.1) {
+                let wrap = i.events.iter().position(|e| match e {
+                    Event::Text(t) => {
+                        let mut chars = t.chars();
+                        chars.next().is_some_and(|c| chars.next().is_none() && textops::can_wrap(text, r, c))
+                    }
+                    _ => false,
+                });
+                if let Some(p) = wrap {
+                    if let Event::Text(t) = i.events.remove(p) {
+                        acts.extend(t.chars().next().map(Act::Wrap));
+                    }
+                }
+            }
+            if i.consume_key(Modifiers::NONE, Key::F12) {
+                acts.push(Act::Definition);
+            }
+            if i.consume_key(Modifiers::NONE, Key::F2) {
+                acts.push(Act::Rename);
+            }
             if quick_open {
                 if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
                     acts.push(Act::QuickDown);
@@ -835,14 +1046,28 @@ pub fn editor_ui(ui: &mut egui::Ui, tab: &mut Tab, ec: EditorCtx) -> EditorResul
             } else if i.consume_key(Modifiers::NONE, Key::Tab) {
                 acts.push(Act::Indent);
             }
-            if i.consume_key(Modifiers::COMMAND, Key::Space) {
-                acts.push(Act::Trigger);
-            }
-            if i.consume_key(Modifiers::COMMAND, Key::Period) {
-                acts.push(Act::QuickFix);
-            }
-            if i.consume_key(Modifiers::COMMAND, Key::Slash) {
-                acts.push(Act::Comment);
+            // AltGr can arrive as Ctrl+Alt: that's a typed character, not a shortcut.
+            if !i.modifiers.alt {
+                if i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z) || i.consume_key(Modifiers::COMMAND, Key::Y) {
+                    acts.push(Act::Redo);
+                } else if i.consume_key(Modifiers::COMMAND, Key::Z) {
+                    acts.push(Act::Undo);
+                }
+                if i.consume_key(Modifiers::COMMAND, Key::Space) {
+                    acts.push(Act::Trigger);
+                }
+                if i.consume_key(Modifiers::COMMAND, Key::Period) {
+                    acts.push(Act::QuickFix);
+                }
+                if i.consume_key(Modifiers::COMMAND, Key::Slash) {
+                    acts.push(Act::Comment);
+                }
+                if i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::K) {
+                    acts.push(Act::DeleteLine);
+                }
+                if i.consume_key(Modifiers::COMMAND, Key::D) {
+                    acts.push(Act::Duplicate);
+                }
             }
         });
     }
@@ -862,8 +1087,60 @@ pub fn editor_ui(ui: &mut egui::Ui, tab: &mut Tab, ec: EditorCtx) -> EditorResul
                 *ec.completion = None;
                 cancel_request = true;
             }
+            Act::Home { extend } => {
+                if let Some(r) = TextEditState::load(&ctx, id).and_then(|s| s.cursor.char_range()) {
+                    let target = textops::smart_home(&tab.text, r.primary.index.0);
+                    let anchor = if *extend { r.secondary.index.0 } else { target };
+                    set_cursor(&ctx, id, anchor, target);
+                }
+            }
+            Act::SmartBackspace(x, y) => {
+                mark_undo(&ctx, id, &tab.text);
+                let (bx, by) = (byte_of(&tab.text, *x), byte_of(&tab.text, *y));
+                tab.text.replace_range(bx..by, "");
+                set_cursor(&ctx, id, *x, *x);
+                changed = true;
+            }
+            Act::Wrap(open) => {
+                if let Some(r) = get_cursor(&ctx, id) {
+                    mark_undo(&ctx, id, &tab.text);
+                    let (na, nb) = textops::wrap_selection(&mut tab.text, r, *open);
+                    set_cursor(&ctx, id, na, nb);
+                    changed = true;
+                }
+            }
+            Act::Duplicate | Act::DeleteLine | Act::MoveUp | Act::MoveDown => {
+                if let Some(r) = get_cursor(&ctx, id) {
+                    let before = tab.text.clone();
+                    let moved = match a {
+                        Act::Duplicate => Some(textops::duplicate_lines(&mut tab.text, r)),
+                        Act::DeleteLine => {
+                            let c = textops::delete_lines(&mut tab.text, r);
+                            Some((c, c))
+                        }
+                        _ => textops::move_lines(&mut tab.text, r, *a == Act::MoveUp),
+                    };
+                    if let Some((na, nb)) = moved {
+                        mark_undo(&ctx, id, &before);
+                        set_cursor(&ctx, id, na, nb);
+                        *ec.completion = None;
+                        cancel_request = true;
+                        changed = true;
+                    }
+                }
+            }
+            Act::Undo | Act::Redo => {
+                if step_history(&ctx, id, &mut tab.text, *a == Act::Redo) {
+                    *ec.completion = None;
+                    cancel_request = true;
+                    changed = true;
+                }
+            }
+            Act::Definition => definition = get_cursor(&ctx, id).map(|r| r.0),
+            Act::Rename => rename = get_cursor(&ctx, id).map(|r| r.0),
             Act::Indent | Act::Dedent | Act::Comment => {
                 if let Some(r) = get_cursor(&ctx, id) {
+                    mark_undo(&ctx, id, &tab.text);
                     let (na, nb) = match a {
                         Act::Indent => indent(&mut tab.text, r),
                         Act::Dedent => dedent(&mut tab.text, r),
@@ -907,6 +1184,8 @@ pub fn editor_ui(ui: &mut egui::Ui, tab: &mut Tab, ec: EditorCtx) -> EditorResul
     // ---- the text area
     let prev_len = tab.text.chars().count();
     let prev_cursor = get_cursor(&ctx, id).map(|r| r.1);
+    // Undo, redo and paste also change the length by one, but aren't typing.
+    let typed = if has_focus { typed_char(&ctx) } else { None };
 
     let gutter_digits = (tab.text.matches('\n').count() + 1).to_string().len().max(3);
     let char_w = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
@@ -951,7 +1230,8 @@ pub fn editor_ui(ui: &mut egui::Ui, tab: &mut Tab, ec: EditorCtx) -> EditorResul
             let avail_h = ui.available_height();
             let (gutter_rect, _) = ui.allocate_exact_size(Vec2::new(gutter_w, avail_h), Sense::hover());
             let rows = ((avail_h / row_h) as usize).max(1);
-            // Reserved before the text, so the block highlight is drawn behind it.
+            // Reserved before the text, so these highlights are drawn behind it.
+            let back_shape = ui.painter().add(egui::Shape::Noop);
             let brace_shape = ui.painter().add(egui::Shape::Noop);
             let out = egui::TextEdit::multiline(&mut tab.text)
                 .id(id)
@@ -967,12 +1247,49 @@ pub fn editor_ui(ui: &mut egui::Ui, tab: &mut Tab, ec: EditorCtx) -> EditorResul
 
             text_changed = out.response.response.changed();
             editor_has_focus = out.response.response.has_focus();
+            if out.response.response.clicked() && ctx.input(|i| i.modifiers.command) {
+                definition = out.cursor_range.map(|r| r.primary.index.0);
+            }
             let galley = &out.galley;
             let origin = out.galley_pos;
 
             // gutter: background + line numbers for visible rows
             let painter = ui.painter();
             let clip = ui.clip_rect();
+            // The gutter stays in view when the code is scrolled sideways.
+            let gutter_left = clip.left().max(gutter_rect.left());
+            let gutter_right = gutter_left + gutter_w;
+            let code_painter = painter.with_clip_rect(clip.intersect(egui::Rect::everything_right_of(gutter_right)));
+
+            // the cursor's line, and the find matches
+            let mut back = Vec::new();
+            if let Some(r) = out.cursor_range.filter(|_| editor_has_focus) {
+                let p = galley.pos_from_cursor(r.primary).translate(origin.to_vec2());
+                let area = egui::Rect::from_min_max(Pos2::new(clip.left(), p.top()), Pos2::new(clip.right(), p.bottom()));
+                let fill = if dark { Color32::from_white_alpha(7) } else { Color32::from_black_alpha(9) };
+                back.push(egui::Shape::rect_filled(area, 0.0, fill));
+            }
+            if let Some((matches, current)) = ec.find {
+                let first = galley.cursor_from_pos(Vec2::new(0.0, (clip.top() - origin.y).max(0.0))).index.0;
+                let last = galley.cursor_from_pos(Vec2::new(f32::MAX / 2.0, clip.bottom() - origin.y)).index.0;
+                let from = matches.partition_point(|m| m.1 < first);
+                for (i, &(s, e)) in matches.iter().enumerate().skip(from) {
+                    if s > last {
+                        break;
+                    }
+                    let a = galley.pos_from_cursor(CCursor::new(s)).translate(origin.to_vec2());
+                    let b = galley.pos_from_cursor(CCursor::new(e)).translate(origin.to_vec2());
+                    let right = if (a.top() - b.top()).abs() < 1.0 { b.left() } else { a.left() + char_w };
+                    let area = egui::Rect::from_min_max(a.left_top(), Pos2::new(right.max(a.left() + 2.0), a.bottom()));
+                    let fill = if Some(i) == current {
+                        Color32::from_rgba_unmultiplied(0xF2, 0xA6, 0x3B, 130)
+                    } else {
+                        Color32::from_rgba_unmultiplied(0xE5, 0xC0, 0x4C, 55)
+                    };
+                    back.push(egui::Shape::rect_filled(area, 2.0, fill));
+                }
+            }
+            painter.set(back_shape, egui::Shape::Vec(back));
 
             // the whole `{...}` block when the cursor is next to one of its braces
             let selection = out.cursor_range.map(|r| {
@@ -1002,9 +1319,10 @@ pub fn editor_ui(ui: &mut egui::Ui, tab: &mut Tab, ec: EditorCtx) -> EditorResul
             }
 
             let full = egui::Rect::from_min_max(
-                Pos2::new(gutter_rect.left(), clip.top().min(gutter_rect.top())),
-                Pos2::new(gutter_rect.right(), clip.bottom().max(origin.y + galley.size().y + 4.0)),
+                Pos2::new(gutter_left, clip.top().min(gutter_rect.top())),
+                Pos2::new(gutter_right, clip.bottom().max(origin.y + galley.size().y + 4.0)),
             );
+            painter.rect_filled(full, 0.0, editor_bg);
             painter.rect_filled(full, 0.0, editor_bg.gamma_multiply(0.92));
             let cursor_line = out.cursor_range.map(|r| {
                 tab.text[..byte_of(&tab.text, r.primary.index.0)].matches('\n').count()
@@ -1017,10 +1335,10 @@ pub fn editor_ui(ui: &mut egui::Ui, tab: &mut Tab, ec: EditorCtx) -> EditorResul
                 let y = origin.y + row.pos.y;
                 if new_line && y + row_h >= clip.top() && y <= clip.bottom() {
                     if let Some(&sev) = line_severity.get(&line) {
-                        painter.circle_filled(Pos2::new(gutter_rect.left() + 6.0, y + row_h / 2.0), 3.0, severity_color(sev));
+                        painter.circle_filled(Pos2::new(gutter_left + 6.0, y + row_h / 2.0), 3.0, severity_color(sev));
                     }
                     painter.text(
-                        Pos2::new(gutter_rect.right() - 10.0, y),
+                        Pos2::new(gutter_right - 10.0, y),
                         egui::Align2::RIGHT_TOP,
                         (line + 1).to_string(),
                         font.clone(),
@@ -1069,7 +1387,7 @@ pub fn editor_ui(ui: &mut egui::Ui, tab: &mut Tab, ec: EditorCtx) -> EditorResul
                         let a = galley.pos_from_cursor(CCursor::new(lc + from)).translate(origin.to_vec2());
                         let b = galley.pos_from_cursor(CCursor::new(lc + to)).translate(origin.to_vec2());
                         let x1 = b.left().max(a.left() + char_w);
-                        squiggle(painter, a.left(), x1, a.bottom() - 0.5, severity_color(d.severity));
+                        squiggle(&code_painter, a.left(), x1, a.bottom() - 0.5, severity_color(d.severity));
                         let area = egui::Rect::from_min_max(a.left_top(), Pos2::new(x1, a.bottom()));
                         if pointer.is_some_and(|p| area.contains(p)) && !hover.contains(&d.message.as_str()) {
                             hover.push(&d.message);
@@ -1089,7 +1407,7 @@ pub fn editor_ui(ui: &mut egui::Ui, tab: &mut Tab, ec: EditorCtx) -> EditorResul
                     let b = galley.pos_from_cursor(CCursor::new(to)).translate(origin.to_vec2());
                     if (a.top() - b.top()).abs() < 1.0 {
                         let area = egui::Rect::from_min_max(a.left_top(), Pos2::new(b.left().max(a.left() + 2.0), a.bottom()));
-                        painter.rect_filled(area, 2.0, Color32::from_rgba_unmultiplied(0x56, 0x9C, 0xD6, 45));
+                        code_painter.rect_filled(area, 2.0, Color32::from_rgba_unmultiplied(0x56, 0x9C, 0xD6, 45));
                     }
                 }
             }
@@ -1119,6 +1437,16 @@ pub fn editor_ui(ui: &mut egui::Ui, tab: &mut Tab, ec: EditorCtx) -> EditorResul
                 set_cursor(&ctx, id, ci, ci);
                 ctx.memory_mut(|m| m.request_focus(id));
             }
+
+            // show a find match or a definition
+            if let Some((a, b, focus)) = tab.reveal.take() {
+                let rect = galley.pos_from_cursor(CCursor::new(b)).translate(origin.to_vec2());
+                ui.scroll_to_rect(rect.expand2(Vec2::new(char_w * 4.0, row_h * 3.0)), Some(Align::Center));
+                set_cursor(&ctx, id, a, b);
+                if focus {
+                    ctx.memory_mut(|m| m.request_focus(id));
+                }
+            }
         });
     });
     let _ = scroll;
@@ -1128,12 +1456,16 @@ pub fn editor_ui(ui: &mut egui::Ui, tab: &mut Tab, ec: EditorCtx) -> EditorResul
     if text_changed {
         changed = true;
         let new_len = tab.text.chars().count();
-        if let (Some(pc), Some(cc)) = (prev_cursor, cursor_now) {
-            if new_len == prev_len + 1 && cc == pc + 1 && cc > 0 {
-                let typed = tab.text[byte_of(&tab.text, cc - 1)..].chars().next().unwrap_or('\0');
-                if let Some(nc) = after_char_typed(&mut tab.text, cc, typed) {
+        if let (Some(pc), Some(cc), Some(c)) = (prev_cursor, cursor_now, typed) {
+            if new_len == prev_len + 1 && cc == pc + 1 && tab.text[byte_of(&tab.text, cc - 1)..].starts_with(c) {
+                let mut end = cc;
+                if let Some(nc) = after_char_typed(&mut tab.text, cc, c) {
                     set_cursor(&ctx, id, nc, nc);
                     cursor_now = Some(nc);
+                    end = nc;
+                }
+                if ec.format_on_type && !session_open && tab.path.is_some() && tab.is_java() {
+                    format_line = indent::format_line(&tab.text, byte_of(&tab.text, end), c);
                 }
             }
         }
@@ -1384,8 +1716,21 @@ pub fn editor_ui(ui: &mut egui::Ui, tab: &mut Tab, ec: EditorCtx) -> EditorResul
 
     if changed {
         tab.dirty = tab.text != tab.saved;
+        tab.last_edit = Some(Instant::now());
     }
-    EditorResult { line_col, changed, used, request, accepted, cancel_request, quick_request, quick_choice }
+    EditorResult {
+        line_col,
+        changed,
+        used,
+        request,
+        accepted,
+        cancel_request,
+        quick_request,
+        quick_choice,
+        format_line,
+        definition,
+        rename,
+    }
 }
 
 #[cfg(test)]
@@ -1432,6 +1777,216 @@ mod tests {
         assert_eq!(typed("// note |", '{'), "// note {|");
         // not in front of an identifier
         assert_eq!(typed("|foo", '{'), "{|foo");
+    }
+
+    #[test]
+    fn quotes_respect_strings_escapes_and_comments() {
+        // an escaped quote stays inside the string
+        assert_eq!(typed("x = \"a\\|\";", '"'), "x = \"a\\\"|\";");
+        // an escaped backslash doesn't escape the quote
+        assert_eq!(typed("x = \"a\\\\|\";", '"'), "x = \"a\\\\\"|;");
+        // no pairing inside a string or comment
+        assert_eq!(typed("x = \"it |\";", '\''), "x = \"it '|\";");
+        assert_eq!(typed("// say |", '"'), "// say \"|");
+        // a quote char literal doesn't open a string
+        assert_eq!(typed("char c = '\"'; foo|", '('), "char c = '\"'; foo(|)");
+        // text blocks count as strings across lines
+        assert_eq!(typed("s = \"\"\"\n  a |\n\"\"\";", '('), "s = \"\"\"\n  a (|\n\"\"\";");
+    }
+
+    #[test]
+    fn enter_uses_the_structure_of_the_code() {
+        assert_eq!(typed("    if (a)|", '\n'), "    if (a)\n        |");
+        assert_eq!(typed("    if (a)\n        b();|", '\n'), "    if (a)\n        b();\n    |");
+        assert_eq!(typed("    void f() { // x|", '\n'), "    void f() { // x\n        |\n    }");
+        assert_eq!(typed("    foo(|)", '\n'), "    foo(\n        |\n    )");
+        assert_eq!(typed("    void f(int a,\n            int b) {|}", '\n'), "    void f(int a,\n            int b) {\n        |\n    }");
+    }
+
+    #[test]
+    fn enter_on_a_blank_line_leaves_no_trailing_spaces() {
+        assert_eq!(typed("    a;\n    |", '\n'), "    a;\n\n    |");
+    }
+
+    #[test]
+    fn enter_continues_block_comments() {
+        assert_eq!(typed("    /**|", '\n'), "    /**\n     * |\n     */");
+        assert_eq!(typed("    /**\n     * a|\n     */", '\n'), "    /**\n     * a\n     * |\n     */");
+    }
+
+    #[test]
+    fn a_closing_brace_lines_up_with_its_block() {
+        assert_eq!(typed("class A {\n    void f() {\n        x();\n        |", '}'), "class A {\n    void f() {\n        x();\n    }|");
+        assert_eq!(typed("void f() {\n  x();\n          |", '}'), "void f() {\n  x();\n}|");
+        // not inside a comment or a text block
+        assert_eq!(typed("/*\n    |", '}'), "/*\n    }|");
+    }
+
+    #[test]
+    fn a_semicolon_types_over_the_next_one() {
+        assert_eq!(typed("foo()|;", ';'), "foo();|");
+        assert_eq!(typed("s = \"a|;\"", ';'), "s = \"a;|;\"");
+    }
+
+    #[test]
+    fn comment_toggle_ignores_a_line_the_selection_only_touches() {
+        let mut t = "// a\n// b\nc".to_string();
+        toggle_comment(&mut t, (0, 10)); // ends at column 0 of "c"
+        assert_eq!(t, "a\nb\nc");
+        let mut t = "\n\n".to_string();
+        toggle_comment(&mut t, (0, 2));
+        assert_eq!(t, "\n\n");
+    }
+
+    #[test]
+    fn legacy_encodings_are_decoded() {
+        assert_eq!(CP1250_HIGH.chars().count(), 128);
+        let (t, from) = decode_source(&[b'c', 0xE8, 0x9A, 0x9E, 0xC8, 0x8A, 0x8E]);
+        assert_eq!((t.as_str(), from), ("cčšžČŠŽ", Some("Windows-1250")));
+        assert_eq!(decode_source("čaj".as_bytes()), ("čaj".to_string(), None));
+        assert_eq!(decode_source("\u{FEFF}class A".as_bytes()).0, "class A");
+    }
+
+    /// Drives the real widget with key events, for what plain functions can't show.
+    fn run_keys(text: &str, cursor: usize, frames: Vec<Vec<Event>>) -> String {
+        let ctx = egui::Context::default();
+        let id = Id::new("keys-test");
+        let mut tab = Tab::new(None, text.to_string(), id);
+        let index = ProjectIndex::default();
+        let (mut completion, mut session, mut quick_menu) = (None, None, None);
+        let setup = vec![Vec::new(), Vec::new()];
+        for (n, events) in setup.into_iter().chain(frames).chain([Vec::new()]).enumerate() {
+            if n == 1 {
+                ctx.memory_mut(|m| m.request_focus(id));
+                set_cursor(&ctx, id, cursor, cursor);
+            }
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0))),
+                // far apart, so the text box records an undo step between edits
+                time: Some(n as f64 * 5.0),
+                focused: true,
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    editor_ui(
+                        ui,
+                        &mut tab,
+                        EditorCtx {
+                            dark: true,
+                            font_size: 14.0,
+                            index: &index,
+                            completion: &mut completion,
+                            autocomplete: false,
+                            recent: &[],
+                            lsp_ready: false,
+                            diags: &[],
+                            session: &mut session,
+                            quick_menu: &mut quick_menu,
+                            find: None,
+                            format_on_type: false,
+                        },
+                    );
+                });
+            });
+            out.textures_delta.clear();
+        }
+        tab.text
+    }
+
+    fn press(key: Key, modifiers: Modifiers) -> Vec<Event> {
+        vec![Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }]
+    }
+
+    #[test]
+    fn undo_does_not_retrigger_auto_closing() {
+        // Deleting `{` and undoing brings back exactly the original text.
+        let out = run_keys(
+            "class A {",
+            9,
+            vec![
+                press(Key::Backspace, Modifiers::NONE),
+                Vec::new(),
+                press(Key::Z, Modifiers::COMMAND),
+            ],
+        );
+        assert_eq!(out, "class A {");
+    }
+
+    #[test]
+    fn undo_skips_states_that_only_moved_the_cursor() {
+        let out = run_keys(
+            "ab",
+            2,
+            vec![
+                vec![Event::Text("c".into())],
+                Vec::new(),
+                press(Key::ArrowLeft, Modifiers::NONE),
+                Vec::new(),
+                press(Key::ArrowLeft, Modifiers::NONE),
+                Vec::new(),
+                press(Key::Z, Modifiers::COMMAND),
+            ],
+        );
+        assert_eq!(out, "ab");
+    }
+
+    #[test]
+    fn line_commands_are_undoable() {
+        let out = run_keys("a\nb", 0, vec![press(Key::D, Modifiers::COMMAND)]);
+        assert_eq!(out, "a\na\nb");
+        let out = run_keys("a\nb", 0, vec![press(Key::D, Modifiers::COMMAND), Vec::new(), press(Key::Z, Modifiers::COMMAND)]);
+        assert_eq!(out, "a\nb");
+        let out = run_keys("a\nb", 0, vec![press(Key::ArrowDown, Modifiers::ALT)]);
+        assert_eq!(out, "b\na");
+        let shift_ctrl = Modifiers::COMMAND | Modifiers::SHIFT;
+        assert_eq!(run_keys("a\nb", 0, vec![press(Key::K, shift_ctrl)]), "b");
+    }
+
+    #[test]
+    fn typing_a_bracket_over_a_selection_wraps_it() {
+        let ctx_text = "a + b";
+        let ctx = egui::Context::default();
+        let id = Id::new("wrap-test");
+        let mut tab = Tab::new(None, ctx_text.to_string(), id);
+        let index = ProjectIndex::default();
+        let (mut completion, mut session, mut quick_menu) = (None, None, None);
+        for n in 0..4 {
+            if n == 1 {
+                ctx.memory_mut(|m| m.request_focus(id));
+                set_cursor(&ctx, id, 0, 5);
+            }
+            let events = if n == 2 { vec![Event::Text("(".into())] } else { Vec::new() };
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0))),
+                time: Some(n as f64),
+                focused: true,
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    editor_ui(ui, &mut tab, EditorCtx {
+                        dark: true,
+                        font_size: 14.0,
+                        index: &index,
+                        completion: &mut completion,
+                        autocomplete: false,
+                        recent: &[],
+                        lsp_ready: false,
+                        diags: &[],
+                        session: &mut session,
+                        quick_menu: &mut quick_menu,
+                        find: None,
+                        format_on_type: false,
+                    });
+                });
+            });
+            out.textures_delta.clear();
+        }
+        assert_eq!(tab.text, "(a + b)");
+        assert_eq!(get_cursor(&ctx, id), Some((1, 6)));
     }
 
     #[test]
@@ -1531,6 +2086,8 @@ mod tests {
                             diags: &[],
                             session: &mut session,
                             quick_menu: &mut quick_menu,
+                            find: None,
+                            format_on_type: false,
                         },
                     );
                 });

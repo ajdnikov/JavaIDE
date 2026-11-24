@@ -17,6 +17,13 @@ pub struct Settings {
     pub run_args: String,
     /// Completion items accepted recently, most recent first (ranked first in the popup).
     pub recent: Vec<String>,
+    /// Add an `import` by itself when a class has exactly one candidate.
+    pub auto_import: bool,
+    /// Tidy the spacing of a line when it's finished (`;`, `}`, Enter).
+    pub format_on_type: bool,
+    /// The tabs to reopen on the next start.
+    pub open_files: Vec<PathBuf>,
+    pub active_file: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -31,6 +38,10 @@ impl Default for Settings {
             autocomplete: true,
             run_args: String::new(),
             recent: Vec::new(),
+            auto_import: true,
+            format_on_type: true,
+            open_files: Vec::new(),
+            active_file: None,
         }
     }
 }
@@ -74,6 +85,8 @@ impl Settings {
             .unwrap_or_default();
         s.last_folder = s.last_folder.map(|p| from_portable(&p));
         s.jdk_path = s.jdk_path.map(|p| from_portable(&p));
+        s.open_files = s.open_files.iter().map(|p| from_portable(p)).collect();
+        s.active_file = s.active_file.map(|p| from_portable(&p));
         s.font_size = s.font_size.clamp(8.0, 40.0);
         s.recent.truncate(Settings::RECENT_MAX);
         s
@@ -83,6 +96,8 @@ impl Settings {
         let mut s = self.clone();
         s.last_folder = s.last_folder.map(|p| to_portable(&p));
         s.jdk_path = s.jdk_path.map(|p| to_portable(&p));
+        s.open_files = s.open_files.iter().map(|p| to_portable(p)).collect();
+        s.active_file = s.active_file.map(|p| to_portable(&p));
         if let Ok(t) = serde_json::to_string_pretty(&s) {
             let _ = std::fs::write(settings_path(), t);
         }

@@ -171,14 +171,14 @@ static PROBLEM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^(.+?\.java):(\d+): (error|warning): (.*)$").unwrap());
 
 pub fn has_main(src: &str) -> bool {
-    MAIN_RE.is_match(src)
+    MAIN_RE.is_match(&crate::complete::blank_comments_and_strings(src))
 }
 
 /// Fully-qualified class name for a source file (works for Java 25 compact
 /// source files too, whose implicit class is named after the file).
 pub fn main_class(file: &Path, src: &str) -> String {
     let stem = file.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    match PACKAGE_RE.captures(src) {
+    match PACKAGE_RE.captures(&crate::complete::blank_comments_and_strings(src)) {
         Some(c) => format!("{}.{}", &c[1], stem),
         None => stem,
     }
@@ -354,6 +354,9 @@ mod tests {
     fn main_class_and_args() {
         assert_eq!(main_class(Path::new("a/b/App.java"), "package com.x;\nclass App {}"), "com.x.App");
         assert_eq!(main_class(Path::new("Hello.java"), "void main() {}"), "Hello");
+        assert_eq!(main_class(Path::new("A.java"), "/*\n package old;\n*/\nclass A {}"), "A");
+        assert!(!has_main("// void main() {}\nString s = \"void main()\";"));
+        assert!(has_main("public static void main(String[] a) {}"));
         assert_eq!(split_args(r#"one "two three" 'x y' z"#), vec!["one", "two three", "x y", "z"]);
     }
 }

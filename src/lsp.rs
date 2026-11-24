@@ -89,6 +89,14 @@ pub enum Event {
     /// The server wants this edit applied; answer with `reply_apply_edit`.
     ApplyEdit { request: Value, ops: Vec<FileOp> },
     CommandFailed { message: String },
+    Formatted { id: u64, edits: Vec<TextEdit> },
+    /// Where a symbol is declared; `None` if it has no source file here.
+    Definition { id: u64, target: Option<(PathBuf, Pos)> },
+    Renamed { id: u64, result: Result<Vec<FileOp>, String> },
+    /// The fixes offered for a missing class, for the automatic import.
+    ImportChoices { id: u64, items: Vec<CodeAction> },
+    ImportEdit { id: u64, ops: Vec<FileOp> },
+    OrganizeAction { id: u64, action: Option<Value> },
 }
 
 enum Pending {
@@ -98,6 +106,12 @@ enum Pending {
     CodeActions,
     ActionResolve,
     Command,
+    Format,
+    Definition,
+    Rename,
+    ImportChoices,
+    ImportEdit,
+    Organize,
 }
 
 struct Shared {
@@ -341,6 +355,8 @@ fn java_settings(root: &Path, jdk: &Jdk, single_file: bool) -> Value {
         },
         "project": { "referencedLibraries": ["lib/**/*.jar"], "sourcePaths": source_paths },
         "errors": { "incompleteClasspath": { "severity": "warning" } },
+        // Comments are the author's own layout, so the formatter leaves them alone.
+        "format": { "enabled": true, "comments": { "enabled": false }, "onType": { "enabled": false } },
         "completion": {
             "enabled": true,
             "engine": "ecj",
@@ -408,6 +424,10 @@ fn init_params(root: &Path, settings: &Value, folders: &Value) -> Value {
                     "dataSupport": true,
                     "resolveSupport": { "properties": ["edit"] }
                 },
+                "formatting": { "dynamicRegistration": false },
+                "rangeFormatting": { "dynamicRegistration": false },
+                "definition": { "dynamicRegistration": false },
+                "rename": { "dynamicRegistration": false },
                 "publishDiagnostics": { "relatedInformation": false }
             }
         },
@@ -603,6 +623,73 @@ impl Lsp {
             "context": { "diagnostics": diagnostics, "triggerKind": 1 }
         });
         Some(self.request("textDocument/codeAction", params, Pending::CodeActions))
+    }
+
+    /// The document's URI, if the server is ready and has it open.
+    fn open_uri(&self, path: &Path) -> Option<String> {
+        let uri = path_to_uri(path);
+        (self.is_ready() && self.docs.contains_key(&uri)).then_some(uri)
+    }
+
+    /// Format these lines (first, last), or the whole file with `None`.
+    pub fn request_format(&mut self, path: &Path, lines: Option<(usize, usize)>) -> Option<u64> {
+        let uri = self.open_uri(path)?;
+        let options = json!({ "tabSize": 4, "insertSpaces": true });
+        let (method, params) = match lines {
+            Some((first, last)) => (
+                "textDocument/rangeFormatting",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "options": options,
+                    "range": { "start": { "line": first, "character": 0 }, "end": { "line": last + 1, "character": 0 } }
+                }),
+            ),
+            None => ("textDocument/formatting", json!({ "textDocument": { "uri": uri }, "options": options })),
+        };
+        Some(self.request(method, params, Pending::Format))
+    }
+
+    pub fn request_definition(&mut self, path: &Path, pos: Pos) -> Option<u64> {
+        let uri = self.open_uri(path)?;
+        let params = json!({ "textDocument": { "uri": uri }, "position": { "line": pos.0, "character": pos.1 } });
+        Some(self.request("textDocument/definition", params, Pending::Definition))
+    }
+
+    pub fn request_rename(&mut self, path: &Path, pos: Pos, name: &str) -> Option<u64> {
+        let uri = self.open_uri(path)?;
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": pos.0, "character": pos.1 },
+            "newName": name
+        });
+        Some(self.request("textDocument/rename", params, Pending::Rename))
+    }
+
+    /// Ask which imports could fix this problem.
+    pub fn request_import_choices(&mut self, path: &Path, diag: &Diag) -> Option<u64> {
+        let uri = self.open_uri(path)?;
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "range": diag.raw["range"],
+            "context": { "diagnostics": [*diag.raw], "only": ["quickfix"], "triggerKind": 2 }
+        });
+        Some(self.request("textDocument/codeAction", params, Pending::ImportChoices))
+    }
+
+    pub fn resolve_import(&mut self, action: &Value) -> u64 {
+        self.request("codeAction/resolve", action.clone(), Pending::ImportEdit)
+    }
+
+    /// Ask for the "Organize imports" action of this file.
+    pub fn request_organize(&mut self, path: &Path) -> Option<u64> {
+        let uri = self.open_uri(path)?;
+        let zero = json!({ "line": 0, "character": 0 });
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "range": { "start": zero, "end": zero },
+            "context": { "diagnostics": [], "only": ["source.organizeImports"], "triggerKind": 1 }
+        });
+        Some(self.request("textDocument/codeAction", params, Pending::Organize))
     }
 
     /// Start a chosen code action. `resolved` means the server already filled it in.
@@ -865,7 +952,101 @@ fn handle_response(id: Option<u64>, msg: &Value, tx: &Sender<Vec<u8>>, events: &
                 let _ = events.send(Event::CommandFailed { message });
             }
         }
+        Some(Pending::Format) => {
+            let _ = events.send(Event::Formatted { id, edits: parse_edits(result) });
+        }
+        Some(Pending::Definition) => {
+            let _ = events.send(Event::Definition { id, target: parse_location(result) });
+        }
+        Some(Pending::Rename) => {
+            let result = match msg.get("error") {
+                Some(e) => Err(e["message"].as_str().unwrap_or("The rename failed.").to_string()),
+                None => Ok(parse_workspace_edit(result)),
+            };
+            let _ = events.send(Event::Renamed { id, result });
+        }
+        Some(Pending::ImportChoices) => {
+            let commands = shared.commands.lock().map(|c| c.clone()).unwrap_or_default();
+            let _ = events.send(Event::ImportChoices { id, items: parse_code_actions(result, &commands) });
+        }
+        Some(Pending::ImportEdit) => {
+            let _ = events.send(Event::ImportEdit { id, ops: parse_workspace_edit(&result["edit"]) });
+        }
+        Some(Pending::Organize) => {
+            let action = result
+                .as_array()
+                .and_then(|a| a.iter().find(|x| x["kind"].as_str() == Some("source.organizeImports")))
+                .cloned();
+            let _ = events.send(Event::OrganizeAction { id, action });
+        }
         None => {}
+    }
+}
+
+/// The first target of a definition response, if it's a file on disk.
+fn parse_location(v: &Value) -> Option<(PathBuf, Pos)> {
+    let first = match v.as_array() {
+        Some(a) => a.first()?,
+        None => v,
+    };
+    let uri = first["uri"].as_str().or(first["targetUri"].as_str())?;
+    let range = if first.get("targetSelectionRange").is_some() { &first["targetSelectionRange"] } else { &first["range"] };
+    Some((uri_to_path(uri)?, parse_pos(&range["start"])))
+}
+
+/// The class name a "cannot be resolved" problem is about. Only capitalised names
+/// count, and only while the problem's position still holds that name.
+pub fn missing_type(text: &str, d: &Diag) -> Option<String> {
+    const UNDEFINED_TYPE: &str = "16777218";
+    const UNRESOLVED_NAME: &str = "570425394";
+    let code = match &d.raw["code"] {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    if code != UNDEFINED_TYPE && code != UNRESOLVED_NAME {
+        return None;
+    }
+    let name = d.message.strip_suffix(" cannot be resolved to a type").or(d.message.strip_suffix(" cannot be resolved"))?;
+    let well_formed = name.chars().count() >= 2
+        && name.chars().next().is_some_and(char::is_uppercase)
+        && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+    if !well_formed {
+        return None;
+    }
+    let (s, e) = (byte_of_pos(text, d.start), byte_of_pos(text, d.end));
+    let found = text.get(s..e)?;
+    let exact = found.strip_prefix(name).is_some_and(|rest| rest.is_empty() || rest.starts_with('.'));
+    exact.then(|| name.to_string())
+}
+
+/// The "Import 'Name' (package)" fixes for `name`.
+pub fn import_choices(items: &[CodeAction], name: &str) -> Vec<CodeAction> {
+    let prefix = format!("Import '{name}' (");
+    items.iter().filter(|a| a.title.starts_with(&prefix)).cloned().collect()
+}
+
+/// The package named by an "Import 'Name' (package)" title.
+pub fn import_package(title: &str) -> &str {
+    title.rsplit_once('(').map_or(title, |(_, p)| p.trim_end_matches(')'))
+}
+
+/// Keep problems on their lines after edits were applied above them.
+pub fn shift_diags(diags: &mut [Diag], edits: &[TextEdit]) {
+    for d in diags {
+        let delta: isize = edits
+            .iter()
+            .filter(|e| e.end <= d.start)
+            .map(|e| e.text.matches('\n').count() as isize - (e.end.0 - e.start.0) as isize)
+            .sum();
+        if delta == 0 {
+            continue;
+        }
+        d.start.0 = d.start.0.saturating_add_signed(delta);
+        d.end.0 = d.end.0.saturating_add_signed(delta);
+        let mut raw = (*d.raw).clone();
+        raw["range"]["start"]["line"] = json!(d.start.0);
+        raw["range"]["end"]["line"] = json!(d.end.0);
+        d.raw = Arc::new(raw);
     }
 }
 
@@ -908,7 +1089,7 @@ fn parse_code_actions(result: &Value, commands: &[String]) -> Vec<CodeAction> {
     items
 }
 
-fn parse_workspace_edit(edit: &Value) -> Vec<FileOp> {
+pub fn parse_workspace_edit(edit: &Value) -> Vec<FileOp> {
     let mut ops = Vec::new();
     if let Some(changes) = edit["documentChanges"].as_array() {
         for c in changes {
@@ -1299,6 +1480,55 @@ mod tests {
         assert_eq!(i.kind, Kind::Class);
         assert_eq!(strip_stops(&i.insert), ("ArrayList<>".to_string(), vec![(0, 10, 10)]));
         assert_eq!(i.lsp.unwrap().start, Some((3, 8)));
+    }
+
+    fn diag(code: &str, message: &str, start: Pos, end: Pos) -> Diag {
+        let raw = json!({
+            "code": code,
+            "message": message,
+            "range": { "start": { "line": start.0, "character": start.1 }, "end": { "line": end.0, "character": end.1 } }
+        });
+        Diag { start, end, severity: 1, message: message.into(), raw: Arc::new(raw) }
+    }
+
+    #[test]
+    fn only_real_missing_classes_are_imported() {
+        let t = "List<T> a;\nArrays.sort(x);\nfoo();";
+        let name = |d: Diag| missing_type(t, &d);
+        assert_eq!(name(diag("16777218", "List cannot be resolved to a type", (0, 0), (0, 4))).as_deref(), Some("List"));
+        assert_eq!(name(diag("570425394", "Arrays cannot be resolved", (1, 0), (1, 6))).as_deref(), Some("Arrays"));
+        // a type parameter, a variable, another kind of problem, a stale position
+        assert_eq!(name(diag("16777218", "T cannot be resolved to a type", (0, 5), (0, 6))), None);
+        assert_eq!(name(diag("570425394", "foo cannot be resolved", (2, 0), (2, 3))), None);
+        assert_eq!(name(diag("1", "List cannot be resolved to a type", (0, 0), (0, 4))), None);
+        assert_eq!(name(diag("16777218", "List cannot be resolved to a type", (2, 0), (2, 3))), None);
+    }
+
+    #[test]
+    fn import_titles_are_filtered_and_parsed() {
+        let action = |t: &str| CodeAction { title: t.into(), kind: "quickfix".into(), raw: Arc::new(json!({})) };
+        let items = [action("Import 'Date' (java.sql)"), action("Import 'Date' (java.util)"), action("Create class 'Date'"), action("Import 'Dates' (x)")];
+        let found = import_choices(&items, "Date");
+        assert_eq!(found.len(), 2);
+        assert_eq!(import_package(&found[1].title), "java.util");
+    }
+
+    #[test]
+    fn problems_follow_lines_added_above_them() {
+        let mut d = [diag("1", "x", (3, 4), (3, 8)), diag("1", "y", (0, 0), (0, 1))];
+        let edits = [TextEdit { start: (1, 0), end: (1, 0), text: "import a.B;\n\n".into() }];
+        shift_diags(&mut d, &edits);
+        assert_eq!((d[0].start, d[0].end), ((5, 4), (5, 8)));
+        assert_eq!(d[0].raw["range"]["start"]["line"], 5);
+        assert_eq!(d[1].start, (0, 0));
+    }
+
+    #[test]
+    fn definitions_outside_the_file_system_have_no_target() {
+        let file = json!([{ "uri": "file:///F:/p/A.java", "range": { "start": { "line": 2, "character": 5 }, "end": { "line": 2, "character": 6 } } }]);
+        assert_eq!(parse_location(&file).unwrap().1, (2, 5));
+        assert!(parse_location(&json!([{ "uri": "jdt://contents/java.base/String.class", "range": {} }])).is_none());
+        assert!(parse_location(&json!([])).is_none());
     }
 
     /// Runs the real server: `JAVAIDE_JDTLS=<server folder> cargo test -- --ignored real_server`.

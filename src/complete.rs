@@ -429,6 +429,7 @@ fn blank_uncached(src: &str) -> String {
             q @ (b'"' | b'\'') => {
                 let triple = q == b'"' && src[i..].starts_with("\"\"\"");
                 i += if triple { 3 } else { 1 };
+                let mut closed = false;
                 while i < n {
                     if b[i] == b'\\' {
                         i += 2;
@@ -437,16 +438,19 @@ fn blank_uncached(src: &str) -> String {
                     if triple {
                         if src.as_bytes()[i..].starts_with(b"\"\"\"") {
                             i += 3;
+                            closed = true;
                             break;
                         }
                     } else if b[i] == q || b[i] == b'\n' {
                         i += 1;
+                        closed = true;
                         break;
                     }
                     i += 1;
                 }
                 // keep the quotes so `"x".` can still be recognised as a String
-                blank(&mut out, s + 1, i.saturating_sub(1).max(s + 1));
+                let end = if closed { i - 1 } else { i };
+                blank(&mut out, s + 1, end.max(s + 1));
             }
             _ => i += 1,
         }
@@ -649,26 +653,58 @@ pub struct Completions {
     pub items: Vec<Item>,
 }
 
+/// Whether the end of `before` is inside a comment, string, char or text block.
 pub fn in_string_or_comment(before: &str) -> bool {
-    if let Some(o) = before.rfind("/*") {
-        if !before[o..].contains("*/") {
-            return true;
+    let b = before.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    while i < n {
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'/') => match before[i..].find('\n') {
+                Some(p) => i += p + 1,
+                None => return true,
+            },
+            b'/' if b.get(i + 1) == Some(&b'*') => match before[i + 2..].find("*/") {
+                Some(p) => i += p + 4,
+                None => return true,
+            },
+            b'"' if b[i..].starts_with(b"\"\"\"") => {
+                i += 3;
+                loop {
+                    if i >= n {
+                        return true;
+                    }
+                    if b[i] == b'\\' {
+                        i += 2;
+                    } else if b[i..].starts_with(b"\"\"\"") {
+                        i += 3;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            q @ (b'"' | b'\'') => {
+                i += 1;
+                loop {
+                    if i >= n {
+                        return true;
+                    }
+                    match b[i] {
+                        b'\\' => i += 2,
+                        b'\n' => break, // an unterminated literal ends with its line
+                        c if c == q => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            _ => i += 1,
         }
     }
-    let line = &before[before.rfind('\n').map_or(0, |i| i + 1)..];
-    let mut in_str = false;
-    let mut prev = '\0';
-    let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
-        if !in_str && c == '/' && chars.peek() == Some(&'/') {
-            return true;
-        }
-        if c == '"' && prev != '\\' {
-            in_str = !in_str;
-        }
-        prev = if prev == '\\' && c == '\\' { '\0' } else { c };
-    }
-    in_str
+    false
 }
 
 pub fn complete(

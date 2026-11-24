@@ -4,6 +4,23 @@ use super::*;
 
 impl eframe::App for IdeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
+    }
+
+    fn on_exit(&mut self) {
+        self.remember_tabs();
+        self.settings.save();
+        self.stop();
+        self.term = None;
+        if let Some(mut l) = self.lsp.take() {
+            l.stop(true);
+        }
+    }
+}
+
+impl IdeApp {
+    /// One frame of the whole window.
+    pub(super) fn draw(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.apply_theme(&ctx);
         self.poll_processes(&ctx);
@@ -35,35 +52,76 @@ impl eframe::App for IdeApp {
         egui::CentralPanel::default().show(ui, |ui| self.central(ui));
         self.dialogs(&ctx);
         self.sync_lsp();
+        self.auto_import_tick(&ctx);
+        self.poll_disk();
 
         if self.phase != Phase::Idle || self.term.is_some() {
             ctx.request_repaint_after(Duration::from_millis(200));
+        } else if !self.tabs.is_empty() {
+            ctx.request_repaint_after(DISK_CHECK);
         }
     }
 
-    fn on_exit(&mut self) {
-        self.settings.save();
-        self.stop();
-        self.term = None;
-        if let Some(mut l) = self.lsp.take() {
-            l.stop(true);
-        }
-    }
-}
-
-impl IdeApp {
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        // A modal dialog owns the keyboard: nothing may act behind it.
+        if self.dialog.is_some() {
+            return;
+        }
         let sc = KeyboardShortcut::new;
         let cmd = Modifiers::COMMAND;
         let cs = Modifiers::COMMAND | Modifiers::SHIFT;
-        let fire = |s: KeyboardShortcut| ctx.input_mut(|i| i.consume_shortcut(&s));
+        // AltGr can arrive as Ctrl+Alt: AltGr+F types `[`, it isn't Ctrl+F.
+        let alt = ctx.input(|i| i.modifiers.alt);
+        let fire = |s: KeyboardShortcut| (!alt || s.modifiers.alt) && ctx.input_mut(|i| i.consume_shortcut(&s));
         if fire(sc(cs, Key::S)) {
             self.save_all();
         } else if fire(sc(cmd, Key::S)) {
             self.save_tab(self.active);
         }
-        if fire(sc(cmd, Key::O)) {
+        if fire(sc(cs, Key::O)) {
+            self.organize_imports();
+        } else if fire(sc(cmd, Key::O)) {
             self.pick_folder();
+        }
+        if fire(sc(Modifiers::SHIFT | Modifiers::ALT, Key::F)) {
+            self.format_document();
+        }
+        if fire(sc(cmd, Key::F)) {
+            self.open_find(ctx, false);
+        }
+        if fire(sc(cmd, Key::H)) {
+            self.open_find(ctx, true);
+        }
+        if fire(sc(Modifiers::SHIFT, Key::F3)) {
+            self.find_step(false);
+        } else if fire(sc(Modifiers::NONE, Key::F3)) {
+            if self.find.query.is_empty() {
+                self.open_find(ctx, false);
+            } else {
+                self.find_step(true);
+            }
+        }
+        if fire(sc(Modifiers::SHIFT, Key::F8)) {
+            self.next_problem(false);
+        } else if fire(sc(Modifiers::NONE, Key::F8)) {
+            self.next_problem(true);
+        }
+        if fire(sc(cmd, Key::G)) && !self.tabs.is_empty() {
+            self.dialog = Some(Dialog::GotoLine { value: String::new() });
+        }
+        if fire(sc(cmd, Key::P)) {
+            self.quick_open();
+        }
+        if fire(sc(cs, Key::T)) {
+            self.reopen_closed();
+        }
+        if self.find.open
+            && self.completion.is_none()
+            && self.session.is_none()
+            && self.quick_menu.is_none()
+            && ctx.input(|i| i.key_pressed(Key::Escape))
+        {
+            self.close_find();
         }
         if fire(sc(cmd, Key::N)) {
             self.new_file_prompt();
@@ -94,8 +152,15 @@ impl IdeApp {
                 self.focus_term_input = true;
             }
         }
-        if fire(sc(cmd, Key::Tab)) && !self.tabs.is_empty() {
-            self.active = (self.active + 1) % self.tabs.len();
+        if !self.tabs.is_empty() {
+            let n = self.tabs.len();
+            if fire(sc(cs, Key::Tab)) {
+                self.active = (self.active + n - 1) % n;
+                self.focus_editor = Some(self.tabs[self.active].id);
+            } else if fire(sc(cmd, Key::Tab)) {
+                self.active = (self.active + 1) % n;
+                self.focus_editor = Some(self.tabs[self.active].id);
+            }
         }
     }
 
@@ -111,6 +176,7 @@ impl IdeApp {
 
     fn open_settings(&mut self) {
         let jdk = self.settings.jdk_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+        self.settings_backup = Some(self.settings.clone());
         self.dialog = Some(Dialog::Settings { jdk });
     }
 
@@ -156,13 +222,48 @@ impl IdeApp {
                     self.settings.save();
                 }
                 ui.separator();
+                if ui.add(egui::Button::new("Reopen Closed Tab").shortcut_text("Ctrl+Shift+T")).clicked() {
+                    self.reopen_closed();
+                }
                 if ui.button("Settings…").clicked() {
                     self.open_settings();
+                }
+                if ui.button("Restart Java Language Server").clicked() {
+                    self.start_lsp();
+                    self.status = "Restarting the Java language server…".into();
                 }
                 ui.separator();
                 if ui.button("Exit").clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
+            });
+            ui.menu_button("Edit", |ui| {
+                if ui.add(egui::Button::new("Find…").shortcut_text("Ctrl+F")).clicked() {
+                    self.open_find(ctx, false);
+                }
+                if ui.add(egui::Button::new("Replace…").shortcut_text("Ctrl+H")).clicked() {
+                    self.open_find(ctx, true);
+                }
+                ui.separator();
+                if ui.add(egui::Button::new("Go to File…").shortcut_text("Ctrl+P")).clicked() {
+                    self.quick_open();
+                }
+                if ui.add_enabled(!self.tabs.is_empty(), egui::Button::new("Go to Line…").shortcut_text("Ctrl+G")).clicked() {
+                    self.dialog = Some(Dialog::GotoLine { value: String::new() });
+                }
+                if ui.add(egui::Button::new("Next Problem").shortcut_text("F8")).clicked() {
+                    self.next_problem(true);
+                }
+                ui.separator();
+                if ui.add(egui::Button::new("Format Document").shortcut_text("Shift+Alt+F")).clicked() {
+                    self.format_document();
+                }
+                if ui.add(egui::Button::new("Organize Imports").shortcut_text("Ctrl+Shift+O")).clicked() {
+                    self.organize_imports();
+                }
+                ui.separator();
+                ui.checkbox(&mut self.settings.auto_import, "Add imports automatically");
+                ui.checkbox(&mut self.settings.format_on_type, "Fix spacing while typing");
             });
             ui.menu_button("Run", |ui| {
                 if ui.add(egui::Button::new("▶ Run").shortcut_text("F5")).clicked() {
@@ -392,11 +493,20 @@ impl IdeApp {
             }
         }
         ui.separator();
+        if self.find.open {
+            self.find_bar(ui);
+            ui.separator();
+        }
 
         if let Some(id) = self.focus_editor.take() {
             ui.ctx().memory_mut(|m| m.request_focus(id));
         }
         let active = self.active.min(self.tabs.len() - 1);
+        if self.find.open {
+            let tab = &self.tabs[active];
+            let cursor = editor::selection_of(ui.ctx(), tab.id).map_or(0, |r| r.0);
+            self.find.refresh(&tab.text, cursor);
+        }
         let lsp_ready = self.lsp.as_ref().is_some_and(Lsp::is_ready);
         let diags: &[lsp::Diag] = self.tabs[active]
             .path
@@ -417,6 +527,8 @@ impl IdeApp {
                 diags,
                 session: &mut self.session,
                 quick_menu: &mut self.quick_menu,
+                find: self.find.open.then_some((self.find.matches.as_slice(), self.find.current)),
+                format_on_type: self.settings.format_on_type && lsp_ready,
             },
         );
         self.line_col = res.line_col;
@@ -453,6 +565,30 @@ impl IdeApp {
                 (_, false) => self.status = "The Java language server is still starting.".into(),
             }
         }
+        if let (Some(line), Some(path)) = (res.format_line, self.tabs[active].path.clone()) {
+            self.want_format = Some((tab_id, path, Some(line), true));
+        }
+        if let Some(c) = res.definition {
+            match self.server_ready_for_tab() {
+                Some((_, path)) => {
+                    let text = &self.tabs[active].text;
+                    self.want_definition = Some((path, lsp::pos_of_byte(text, editor::byte_index(text, c))));
+                }
+                None => {}
+            }
+        }
+        if let Some(c) = res.rename {
+            if let Some((_, path)) = self.server_ready_for_tab() {
+                let text = &self.tabs[active].text;
+                match textops::word_at(text, c) {
+                    Some(name) => {
+                        let pos = lsp::pos_of_byte(text, editor::byte_index(text, c));
+                        self.dialog = Some(Dialog::RenameSymbol { path, pos, name });
+                    }
+                    None => self.status = "Put the cursor on a name to rename it.".into(),
+                }
+            }
+        }
         let changed = res.changed;
         if let Some(action) = res.quick_choice {
             self.run_action(&action, false);
@@ -471,6 +607,82 @@ impl IdeApp {
                 self.problems.retain(|x| lsp::path_key(&x.file) != key);
             }
             ui.ctx().request_repaint();
+        }
+    }
+
+    /// The find (and replace) strip above the editor.
+    fn find_bar(&mut self, ui: &mut egui::Ui) {
+        let (enter, shift) = ui.input(|i| (i.key_pressed(Key::Enter), i.modifiers.shift));
+        let (mut step, mut replace_one, mut replace_all, mut close) = (None, false, false, false);
+        let find_id = Id::new("javaide-find");
+        ui.horizontal(|ui| {
+            let f = &mut self.find;
+            let arrow = if f.show_replace { "⏷" } else { "⏵" };
+            if ui.small_button(arrow).on_hover_text("Show replace (Ctrl+H)").clicked() {
+                f.show_replace = !f.show_replace;
+            }
+            let r = ui.add(egui::TextEdit::singleline(&mut f.query).id(find_id).desired_width(260.0).hint_text("Find"));
+            if f.focus {
+                r.request_focus();
+                editor::select(ui.ctx(), find_id, 0, f.query.chars().count());
+                f.focus = false;
+            }
+            if r.lost_focus() && enter {
+                step = Some(!shift);
+                r.request_focus();
+            }
+            ui.toggle_value(&mut f.match_case, "Aa").on_hover_text("Match case");
+            ui.toggle_value(&mut f.whole_word, "W").on_hover_text("Whole word");
+            ui.toggle_value(&mut f.regex, ".*").on_hover_text("Regular expression");
+            match (&f.error, f.current, f.matches.len()) {
+                (Some(e), ..) => {
+                    ui.colored_label(Color32::from_rgb(0xE0, 0x6C, 0x6C), e);
+                }
+                (None, _, 0) => {
+                    ui.weak(if f.query.is_empty() { "" } else { "No results" });
+                }
+                (None, c, n) => {
+                    ui.label(format!("{} of {n}", c.map_or(0, |c| c + 1)));
+                }
+            }
+            if ui.small_button("↑").on_hover_text("Previous (Shift+F3)").clicked() {
+                step = Some(false);
+            }
+            if ui.small_button("↓").on_hover_text("Next (F3)").clicked() {
+                step = Some(true);
+            }
+            if ui.small_button("✖").on_hover_text("Close (Esc)").clicked() {
+                close = true;
+            }
+        });
+        if self.find.show_replace {
+            ui.horizontal(|ui| {
+                ui.add_space(ui.spacing().interact_size.y);
+                let f = &mut self.find;
+                let r = ui.add(egui::TextEdit::singleline(&mut f.replacement).desired_width(260.0).hint_text("Replace"));
+                if r.lost_focus() && enter {
+                    replace_one = true;
+                    r.request_focus();
+                }
+                if ui.button("Replace").clicked() {
+                    replace_one = true;
+                }
+                if ui.button("Replace All").clicked() {
+                    replace_all = true;
+                }
+            });
+        }
+        if let Some(forward) = step {
+            self.find_step(forward);
+        }
+        if replace_one {
+            self.replace_one();
+        }
+        if replace_all {
+            self.replace_all();
+        }
+        if close {
+            self.close_find();
         }
     }
 
@@ -665,7 +877,7 @@ impl IdeApp {
             ui.separator();
             ui.horizontal(|ui| {
                 self.dialog_buttons(ui, ctx, &dialog, enter, &mut keep, &mut error);
-                let info_only = matches!(dialog, Dialog::About);
+                let info_only = matches!(dialog, Dialog::About | Dialog::FileChanged { .. });
                 if !info_only && ui.button("Cancel").clicked() {
                     keep = false;
                 }
@@ -674,11 +886,21 @@ impl IdeApp {
                 ui.colored_label(Color32::from_rgb(0xE0, 0x6C, 0x6C), e);
             }
         });
-        if esc && error.is_none() {
+        if std::mem::take(&mut self.dialog_done) || (esc && error.is_none()) {
             keep = false;
         }
         if error.is_some() {
             keep = true;
+        }
+        if !keep && matches!(dialog, Dialog::Settings { .. }) {
+            // Still set only if the dialog was left without pressing Save.
+            if let Some(b) = self.settings_backup.take() {
+                self.settings.dark_mode = b.dark_mode;
+                self.settings.font_size = b.font_size;
+                self.settings.autocomplete = b.autocomplete;
+                self.settings.auto_import = b.auto_import;
+                self.settings.format_on_type = b.format_on_type;
+            }
         }
         if keep && self.dialog.is_none() {
             self.dialog = Some(dialog);
@@ -730,6 +952,56 @@ impl IdeApp {
                 ui.add(egui::Slider::new(&mut self.settings.font_size, 8.0..=40.0).text("Editor font size"));
                 ui.checkbox(&mut self.settings.dark_mode, "Dark mode");
                 ui.checkbox(&mut self.settings.autocomplete, "Auto-complete while typing (Ctrl+Space always works)");
+                ui.checkbox(&mut self.settings.auto_import, "Add imports automatically when there is one candidate");
+                ui.checkbox(&mut self.settings.format_on_type, "Fix spacing when a line is finished");
+            }
+            Dialog::GotoLine { value } => {
+                ui.heading("Go to line");
+                let total = self.tabs.get(self.active).map_or(1, |t| t.text.matches('\n').count() + 1);
+                ui.add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY).hint_text(format!("1 - {total}"))).request_focus();
+            }
+            Dialog::QuickOpen { query, files, selected } => {
+                ui.heading("Go to file");
+                let r = ui.add(egui::TextEdit::singleline(query).desired_width(f32::INFINITY).hint_text("File name"));
+                r.request_focus();
+                if r.changed() {
+                    *selected = 0;
+                }
+                let hits = filter_files(files, query);
+                let (up, down) = ui.input_mut(|i| (i.consume_key(Modifiers::NONE, Key::ArrowUp), i.consume_key(Modifiers::NONE, Key::ArrowDown)));
+                if !hits.is_empty() {
+                    if down {
+                        *selected = (*selected + 1) % hits.len();
+                    }
+                    if up {
+                        *selected = (*selected + hits.len() - 1) % hits.len();
+                    }
+                    *selected = (*selected).min(hits.len() - 1);
+                }
+                let mut picked = None;
+                for (i, f) in hits.iter().enumerate() {
+                    let shown = self.root.as_deref().and_then(|r| f.strip_prefix(r).ok()).unwrap_or(f);
+                    if ui.add(egui::Button::selectable(i == *selected, shown.display().to_string())).clicked() {
+                        picked = Some((*f).clone());
+                    }
+                }
+                if hits.is_empty() {
+                    ui.weak("No matching files.");
+                }
+                if let Some(p) = picked {
+                    self.open_file(&p);
+                    self.dialog_done = true;
+                }
+            }
+            Dialog::RenameSymbol { name, .. } => {
+                ui.heading("Rename symbol");
+                ui.label("Renames it everywhere in the project.");
+                ui.add(egui::TextEdit::singleline(name).desired_width(f32::INFINITY)).request_focus();
+            }
+            Dialog::FileChanged { idx } => {
+                ui.heading("File changed on disk");
+                let name = self.tabs.get(*idx).map(Tab::title).unwrap_or_default();
+                ui.label(format!("{name} was changed by another program, and it also has unsaved edits here."));
             }
             Dialog::About => {
                 ui.heading("Java IDE");
@@ -742,11 +1014,23 @@ impl IdeApp {
                         ("Ctrl+B", "Build"),
                         ("Ctrl+Space", "Code completion"),
                         ("Ctrl+.", "Quick fix (add import, ...)"),
+                        ("Ctrl+Shift+O", "Organize imports"),
+                        ("Shift+Alt+F", "Format document"),
+                        ("F12 / Ctrl+click", "Go to definition"),
+                        ("F2", "Rename symbol"),
+                        ("F8 / Shift+F8", "Next / previous problem"),
+                        ("Ctrl+F / Ctrl+H", "Find / replace"),
+                        ("F3 / Shift+F3", "Next / previous match"),
+                        ("Ctrl+P / Ctrl+G", "Go to file / line"),
+                        ("Ctrl+D", "Duplicate line"),
+                        ("Ctrl+Shift+K", "Delete line"),
+                        ("Alt+Up / Alt+Down", "Move line"),
                         ("Tab / Shift+Tab", "Indent / dedent, or next / previous field"),
                         ("Ctrl+/", "Toggle line comment"),
                         ("Ctrl+S / Ctrl+Shift+S", "Save / save all"),
                         ("Ctrl+N / Ctrl+O", "New file / open folder"),
-                        ("Ctrl+W / Ctrl+Tab", "Close / next tab"),
+                        ("Ctrl+W / Ctrl+Shift+T", "Close / reopen tab"),
+                        ("Ctrl+Tab", "Next tab"),
                         ("Ctrl+`", "Terminal"),
                         ("Ctrl+= / Ctrl+-", "Font size"),
                     ] {
@@ -800,9 +1084,16 @@ impl IdeApp {
             }
             Dialog::Rename { path, name } => {
                 if ui.button("Rename").clicked() || enter {
-                    let new = path.with_file_name(name.trim());
-                    if name.trim().is_empty() || new.exists() {
-                        *error = Some("That name is empty or already taken.".into());
+                    let trimmed = name.trim();
+                    if trimmed.is_empty() || trimmed.contains(['/', '\\']) {
+                        *error = Some("Enter a name (no slashes).".into());
+                        return;
+                    }
+                    let new = path.with_file_name(trimmed);
+                    // On Windows `main.java` "exists" when renaming it to `Main.java`.
+                    let only_case = lsp::path_key(&new) == lsp::path_key(path);
+                    if new.exists() && !only_case {
+                        *error = Some("That name is already taken.".into());
                         return;
                     }
                     match std::fs::rename(path, &new) {
@@ -877,12 +1168,62 @@ impl IdeApp {
                     self.settings.save();
                     self.status = format!("Using {} ({})", self.jdk.version, self.jdk.origin);
                     self.term = None; // restarted lazily so PATH picks up the new JDK
+                    self.settings_backup = None;
                     self.start_lsp();
                     *keep = false;
                 }
             }
             Dialog::About => {
                 if ui.button("OK").clicked() || enter {
+                    *keep = false;
+                }
+            }
+            Dialog::GotoLine { value } => {
+                if ui.button("Go").clicked() || enter {
+                    match value.trim().parse::<usize>() {
+                        Ok(n) if n >= 1 => {
+                            if let Some(t) = self.tabs.get_mut(self.active) {
+                                t.goto_line = Some(n);
+                            }
+                            *keep = false;
+                        }
+                        _ => *error = Some("Enter a line number.".into()),
+                    }
+                }
+            }
+            Dialog::QuickOpen { query, files, selected } => {
+                if ui.button("Open").clicked() || enter {
+                    let hits = filter_files(files, query);
+                    if let Some(p) = hits.get(*selected).map(|p| (*p).clone()) {
+                        self.open_file(&p);
+                        *keep = false;
+                    }
+                }
+            }
+            Dialog::RenameSymbol { path, pos, name } => {
+                if ui.button("Rename").clicked() || enter {
+                    let n = name.trim();
+                    if n.is_empty() {
+                        *error = Some("Enter a name.".into());
+                    } else {
+                        if let Some(l) = &mut self.lsp {
+                            self.pending_rename = l.request_rename(path, *pos, n);
+                        }
+                        *keep = false;
+                    }
+                }
+            }
+            Dialog::FileChanged { idx } => {
+                let idx = *idx;
+                if ui.button("Reload from Disk").clicked() {
+                    let path = self.tabs.get(idx).and_then(|t| t.path.clone());
+                    if let Some(bytes) = path.and_then(|p| std::fs::read(p).ok()) {
+                        let (text, _) = editor::decode_source(&bytes);
+                        self.reload_tab(idx, &text);
+                    }
+                    *keep = false;
+                }
+                if ui.button("Keep My Version").clicked() {
                     *keep = false;
                 }
             }

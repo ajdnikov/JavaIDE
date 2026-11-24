@@ -5,11 +5,14 @@ mod app;
 mod complete;
 mod editor;
 mod filetree;
+mod find;
 mod highlight;
+mod indent;
 mod java;
 mod lsp;
 mod proc;
 mod settings;
+mod textops;
 
 use eframe::egui;
 
